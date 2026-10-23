@@ -259,6 +259,7 @@ pub(crate) enum WriteCmd {
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
+        drop_prompt: bool,
         reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
     },
     EndAdmittedSession {
@@ -1617,6 +1618,30 @@ impl WriterHandle {
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
     ) -> StoreResult<HookSessionAdmission> {
+        self.admit_hook_session_event_with_prompt_policy(
+            session,
+            obs,
+            owner_filter,
+            ingest_key,
+            moved_from_cwd,
+            false,
+        )
+        .await
+    }
+
+    /// Admit a hook using the server's configured Codex prompt-drop decision.
+    ///
+    /// # Errors
+    /// Returns ownership, scope, SQL, or writer-channel failures.
+    pub async fn admit_hook_session_event_with_prompt_policy(
+        &self,
+        session: NewSession,
+        obs: Sanitized<NewObservation>,
+        owner_filter: OwnerFilter,
+        ingest_key: Option<String>,
+        moved_from_cwd: Option<String>,
+        drop_prompt: bool,
+    ) -> StoreResult<HookSessionAdmission> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AdmitHookSessionEvent {
             session,
@@ -1624,6 +1649,7 @@ impl WriterHandle {
             owner_filter,
             ingest_key,
             moved_from_cwd,
+            drop_prompt,
             reply: tx,
         })
         .await?;
@@ -4074,15 +4100,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 owner_filter,
                 ingest_key,
                 moved_from_cwd,
+                drop_prompt,
                 reply,
             } => {
-                let result = ops::admit_hook_session_event(
+                let result = ops::admit_hook_session_event_with_prompt_policy(
                     &mut conn,
                     &session,
                     &obs,
                     &owner_filter,
                     ingest_key.as_deref(),
                     moved_from_cwd.as_deref(),
+                    drop_prompt,
                 );
                 send_or_warn(reply, result, "admit_hook_session_event");
             }

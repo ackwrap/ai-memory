@@ -4,11 +4,14 @@
 //! client sends: tool calls by tool-use id prefix (Claude Code marks plugin
 //! tool calls with their own id prefix) and tool names exactly, plus whole
 //! hook event kinds (`drop_events`). A matching event is acknowledged like
-//! any other policy drop. All lists run right after the subagent exclusion in
+//! any other policy drop. Tool/event lists run right after the subagent exclusion in
 //! both the single and the batch ingress, so a marked event always seeds tail
 //! tracking before a policy matcher can drop it, and before it reaches the rate
 //! limiter, the ingest semaphore, the sanitizer or storage. The lists are read
 //! once at startup and bounded, so the checks stay cheap on the hook path.
+//! Configured Codex prompt prefixes instead run during authorized atomic
+//! session admission, preserving existing history and preventing spool replay
+//! from resurrecting an empty background session.
 
 use crate::payload::{HookEnvelope, HookEvent};
 
@@ -32,6 +35,7 @@ pub struct IngestDropList {
     tool_use_id_prefixes: Vec<String>,
     tool_names: Vec<String>,
     drop_events: IngestDropEvents,
+    codex_prompt_prefixes: Vec<String>,
 }
 
 impl IngestDropList {
@@ -55,6 +59,7 @@ impl IngestDropList {
             tool_use_id_prefixes,
             tool_names,
             drop_events,
+            codex_prompt_prefixes: Vec::new(),
         })
     }
 
@@ -101,6 +106,31 @@ impl IngestDropList {
     #[must_use]
     pub fn matches_event_kind(&self, env: &HookEnvelope) -> bool {
         self.drop_events.matches(env)
+    }
+
+    /// Configure literal Codex background-prompt prefixes (empty by default).
+    ///
+    /// # Errors
+    /// Rejects blank, control-containing, oversized, or excessive prefixes.
+    pub fn with_codex_prompt_prefixes(mut self, prefixes: Vec<String>) -> Result<Self, String> {
+        validate("drop_codex_prompt_prefixes", &prefixes)?;
+        self.codex_prompt_prefixes = prefixes;
+        Ok(self)
+    }
+
+    /// Whether the submitted Codex prompt starts with an operator-listed prefix.
+    /// Prompt drops are applied inside authorized, atomic session admission so
+    /// an initial SessionStart and a late spool replay cannot resurrect noise.
+    #[must_use]
+    pub fn matches_codex_prompt(&self, env: &HookEnvelope) -> bool {
+        env.agent == ai_memory_core::AgentKind::Codex
+            && env.event == HookEvent::UserPrompt
+            && env.body_excerpt.as_deref().is_some_and(|prompt| {
+                let prompt = prompt.trim_start_matches(['\u{feff}', ' ', '\r', '\n', '\t']);
+                self.codex_prompt_prefixes
+                    .iter()
+                    .any(|prefix| prompt.starts_with(prefix))
+            })
     }
 }
 
@@ -232,6 +262,56 @@ fn validate(list: &str, entries: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::payload::HookQuery;
+
+    #[test]
+    fn codex_prompt_prefix_policy_is_opt_in_anchored_and_agent_specific() {
+        let prefix = "This is an app-generated request for a suggested next user message.";
+        let list = IngestDropList::default()
+            .with_codex_prompt_prefixes(vec![prefix.into()])
+            .unwrap();
+        for agent in ["codex", "open-code", "claude-code"] {
+            for (prompt, expected) in [
+                (
+                    format!("{prefix} The user did not write this message."),
+                    true,
+                ),
+                (format!("\u{feff}\n {prefix}"), true),
+                (format!("Please explain this:\n{prefix}"), false),
+                (format!("> {prefix}"), false),
+                (format!("```\n{prefix}\n```"), false),
+                (
+                    "Inspect the submodule changes and export a patch.".into(),
+                    false,
+                ),
+                ("看看子模块修改，先提交并导出补丁。".into(), false),
+            ] {
+                let env = agent_event(agent, "user-prompt", serde_json::json!({"prompt": prompt}));
+                assert_eq!(
+                    list.matches_codex_prompt(&env),
+                    expected && agent == "codex"
+                );
+                assert!(!IngestDropList::default().matches_codex_prompt(&env));
+            }
+            let env = agent_event(
+                agent,
+                "post-tool-use",
+                serde_json::json!({"prompt": prefix}),
+            );
+            assert!(!list.matches_codex_prompt(&env));
+        }
+        for invalid in [
+            vec![String::new()],
+            vec!["x\ny".into()],
+            vec!["x".repeat(129)],
+            vec!["x".into(); 65],
+        ] {
+            assert!(
+                IngestDropList::default()
+                    .with_codex_prompt_prefixes(invalid)
+                    .is_err()
+            );
+        }
+    }
 
     fn event(name: &str, body: serde_json::Value) -> HookEnvelope {
         agent_event("claude-code", name, body)

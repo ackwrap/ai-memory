@@ -1,5 +1,14 @@
 # Security & isolation boundaries — inventory and adversarial-test map
 
+Codex prompt policy adds an opt-in admission filter (`drop_codex_prompt_prefixes`).
+`ops.rs::internal_prompt_policy_refuses_foreign_owner_agent_and_scope_before_deletion`
+attempts foreign-owner, foreign-agent and foreign-project suppression and proves
+the same-scope control can suppress an empty shell. Removing any corresponding
+owner/agent/scope check permits the forbidden attempt and fails the test.
+`internal_prompt_policy_failed_delete_rolls_back_tombstone_and_lifecycle` injects
+a SQL deletion failure and verifies rollback. The normal-history and HTTP single/
+batch tests retain real prompts and OpenCode controls. No wiki files are changed.
+
 ai-memory is single-tenant wiki data with optional multi-user attribution, run
 by parallel harnesses and shared teams. A handful of guards keep one project,
 workspace, operator, or untrusted input from crossing into another. Each guard

@@ -1356,6 +1356,9 @@ pub struct IngestSettings {
     /// (`AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use`).
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub drop_events: Vec<String>,
+    /// Literal prefixes of Codex background prompts to discard. Empty by
+    /// default. Other agents and non-prompt events are never matched.
+    pub drop_codex_prompt_prefixes: Vec<String>,
     /// The validated list the hook router checks. Set by [`Config::load`];
     /// never read from or written to a config file. Kept off the `Config`
     /// stack frame because that value is constructed in short-stack CLI
@@ -2569,6 +2572,9 @@ impl Config {
                 config.ingest.drop_tool_names.clone(),
                 &config.ingest.drop_events,
             )
+            .and_then(|list| {
+                list.with_codex_prompt_prefixes(config.ingest.drop_codex_prompt_prefixes.clone())
+            })
             .map_err(|message| anyhow::anyhow!(message))?,
         );
         // A4 entropy filter thresholds: reject an unusable threshold at startup
@@ -5361,6 +5367,27 @@ input_token_safety_margin = {margin}
             Config::default().ingest.drop_list.as_ref(),
             &ai_memory_hooks::IngestDropList::default()
         );
+    }
+
+    #[test]
+    fn ingest_codex_prompt_prefixes_load_from_external_config_and_validate() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ingest]\ndrop_codex_prompt_prefixes = ['Background request:']\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default()
+                .with_codex_prompt_prefixes(vec!["Background request:".into()])
+                .unwrap()
+        );
+        std::fs::write(&path, "[ingest]\ndrop_codex_prompt_prefixes = ['']\n").unwrap();
+        let error = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(format!("{error:#}").contains("drop_codex_prompt_prefixes"));
     }
 
     /// `[ingest] drop_events` names whole hook event kinds to drop (#1241

@@ -71,6 +71,8 @@ impl AdmittedSession {
 /// Result of atomic hook admission.
 #[derive(Clone, Debug)]
 pub enum HookSessionAdmission {
+    /// A known Codex background prompt was acknowledged without storing it.
+    DroppedInternalPrompt,
     /// An ordinary observation was admitted for this persisted session.
     Observation {
         /// Writer-issued guard for the persisted session.
@@ -3122,6 +3124,7 @@ pub fn insert_observation_keyed(
 /// `moved_from_cwd` marks an explicit native relocation (OpenCode
 /// `session.moved`): when the stored cwd still matches it, the live session
 /// row is rebound to this event's scope and cwd in the same transaction.
+#[cfg(test)]
 pub fn admit_hook_session_event(
     conn: &mut Connection,
     session: &NewSession,
@@ -3129,6 +3132,29 @@ pub fn admit_hook_session_event(
     owner_filter: &OwnerFilter,
     ingest_key: Option<&str>,
     moved_from_cwd: Option<&str>,
+) -> StoreResult<HookSessionAdmission> {
+    admit_hook_session_event_with_prompt_policy(
+        conn,
+        session,
+        obs,
+        owner_filter,
+        ingest_key,
+        moved_from_cwd,
+        false,
+    )
+}
+
+/// Hook admission with a server-configured Codex background-prompt decision.
+/// The decision never skips scope, owner, agent, or tombstone validation.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_hook_session_event_with_prompt_policy(
+    conn: &mut Connection,
+    session: &NewSession,
+    obs: &NewObservation,
+    owner_filter: &OwnerFilter,
+    ingest_key: Option<&str>,
+    moved_from_cwd: Option<&str>,
+    drop_prompt: bool,
 ) -> StoreResult<HookSessionAdmission> {
     if obs.session_id != session.id
         || obs.workspace_id != session.workspace_id
@@ -3139,6 +3165,9 @@ pub fn admit_hook_session_event(
         ));
     }
     let session_end = obs.kind == ObservationKind::SessionEnd;
+    let internal_prompt = session.agent_kind == AgentKind::Codex
+        && obs.kind == ObservationKind::UserPrompt
+        && drop_prompt;
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     type Row = (
@@ -3186,6 +3215,16 @@ pub fn admit_hook_session_event(
             // operator or agent never gets this far.
             let scoped_to_session = ws.as_slice() == session.workspace_id.as_bytes()
                 && project.as_slice() == session.project_id.as_bytes();
+            if internal_prompt {
+                // A caller may not use an internal prompt to erase a session in
+                // another scope. Owner and agent were checked above as well.
+                if !scoped_to_session {
+                    return Err(StoreError::SessionCollision);
+                }
+                suppress_empty_internal_session(&tx, session, true)?;
+                tx.commit()?;
+                return Ok(HookSessionAdmission::DroppedInternalPrompt);
+            }
             let same_cwd = matches!(
                 (cwd.as_deref(), session.cwd.as_deref()),
                 (Some(stored), Some(event))
@@ -3221,6 +3260,11 @@ pub fn admit_hook_session_event(
             // session back (#387).
             if session_is_purged(&tx, session)? {
                 return Err(StoreError::SessionPurged(session.id.to_string()));
+            }
+            if internal_prompt {
+                suppress_empty_internal_session(&tx, session, false)?;
+                tx.commit()?;
+                return Ok(HookSessionAdmission::DroppedInternalPrompt);
             }
             // `now` is also the ingest-key TTL clock above; started_at honors
             // the caller's original event time (backfill) and only falls
@@ -3368,6 +3412,65 @@ pub fn admit_hook_session_event(
             ingest,
         })
     }
+}
+
+// Never erase substantive history, handoffs, managed runs, or wiki pages.
+// For a fresh background task, remove only its empty lifecycle shell and
+// tombstone it atomically. Late SessionStart and spool replay use the existing
+// scoped purge guard, including after a server restart. No wiki file is touched.
+fn suppress_empty_internal_session(
+    tx: &Transaction<'_>,
+    session: &NewSession,
+    exists: bool,
+) -> StoreResult<()> {
+    if exists {
+        let protected: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observations WHERE session_id = ?1 \
+                 AND (kind NOT IN ('session-start', 'stop') OR body != '')) \
+             OR EXISTS(SELECT 1 FROM sessions WHERE id = ?1 \
+                 AND (ended_at IS NOT NULL OR summary_page_id IS NOT NULL)) \
+             OR EXISTS(SELECT 1 FROM pages WHERE workspace_id = ?2 AND project_id = ?3 \
+                 AND json_extract(frontmatter_json, '$.session_id') = ?4) \
+             OR EXISTS(SELECT 1 FROM handoffs WHERE from_session_id = ?1 OR accepted_by_session = ?1) \
+             OR EXISTS(SELECT 1 FROM managed_runs WHERE native_session_id = ?4)",
+            params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.id.to_string()],
+            |row| row.get(0),
+        )?;
+        if protected {
+            return Ok(());
+        }
+    }
+    tx.execute(
+        "INSERT INTO purged_sessions (session_id, workspace_id, project_id, purged_at) \
+         VALUES (?1, ?2, ?3, ?4) ON CONFLICT(session_id) DO NOTHING",
+        params![
+            session.id.as_bytes(),
+            session.workspace_id.as_bytes(),
+            session.project_id.as_bytes(),
+            Timestamp::now().as_microsecond()
+        ],
+    )?;
+    if !session_is_purged(tx, session)? {
+        return Err(StoreError::SessionCollision);
+    }
+    tx.execute(
+        "DELETE FROM sessions WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        params![
+            session.id.as_bytes(),
+            session.workspace_id.as_bytes(),
+            session.project_id.as_bytes()
+        ],
+    )?;
+    audit(
+        tx,
+        "drop_internal_hook_session",
+        Some(session.workspace_id.as_bytes()),
+        Some(session.project_id.as_bytes()),
+        None,
+        None,
+        Timestamp::now().as_microsecond(),
+    )?;
+    Ok(())
 }
 
 fn validate_admitted_session(tx: &Transaction<'_>, admitted: &AdmittedSession) -> StoreResult<()> {
@@ -8246,6 +8349,158 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
+    mod internal_prompt_policy {
+        use super::*;
+
+        fn deliver(
+            conn: &mut Connection,
+            session: &NewSession,
+            body: &str,
+            drop_prompt: bool,
+        ) -> StoreResult<HookSessionAdmission> {
+            let mut obs = hook_observation(session);
+            obs.body = body.into();
+            admit_hook_session_event_with_prompt_policy(
+                conn,
+                session,
+                &obs,
+                &OwnerFilter::Unattributed,
+                Some("internal-test"),
+                None,
+                drop_prompt,
+            )
+        }
+
+        fn start(conn: &mut Connection, session: &NewSession) {
+            let mut obs = hook_observation(session);
+            obs.kind = ObservationKind::SessionStart;
+            obs.body.clear();
+            admit_hook_session_event(conn, session, &obs, &OwnerFilter::Unattributed, None, None)
+                .unwrap();
+        }
+
+        #[test]
+        fn internal_prompt_policy_tombstones_fresh_tasks_and_rejects_replay_after_restart() {
+            for with_start in [false, true] {
+                let (tmp, mut conn, ws, proj) = fresh_db();
+                let session = hook_session(SessionId::new(), ws, proj, None);
+                if with_start {
+                    start(&mut conn, &session);
+                }
+                assert!(matches!(
+                    deliver(&mut conn, &session, "internal", true).unwrap(),
+                    HookSessionAdmission::DroppedInternalPrompt
+                ));
+                assert!(session_is_purged(&conn, &session).unwrap());
+                let count: u64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                        params![session.id.as_bytes()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0);
+                drop(conn);
+                let mut conn = Connection::open(tmp.path().join("test.sqlite")).unwrap();
+                assert!(matches!(
+                    begin_session(&mut conn, &session),
+                    Err(StoreError::SessionPurged(_))
+                ));
+                assert!(matches!(
+                    deliver(&mut conn, &session, "late prompt", false),
+                    Err(StoreError::SessionPurged(_))
+                ));
+            }
+        }
+
+        #[test]
+        fn internal_prompt_policy_keeps_normal_history_and_other_agents() {
+            let (_tmp, mut conn, ws, proj) = fresh_db();
+            let session = hook_session(SessionId::new(), ws, proj, None);
+            deliver(&mut conn, &session, "real user prompt", false).unwrap();
+            assert!(matches!(
+                deliver(&mut conn, &session, "internal", true).unwrap(),
+                HookSessionAdmission::DroppedInternalPrompt
+            ));
+            assert!(!session_is_purged(&conn, &session).unwrap());
+            let bodies: String = conn
+                .query_row(
+                    "SELECT group_concat(body) FROM observations WHERE session_id = ?1",
+                    params![session.id.as_bytes()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(bodies, "real user prompt");
+            let mut other = hook_session(SessionId::new(), ws, proj, None);
+            other.agent_kind = AgentKind::OpenCode;
+            assert!(matches!(
+                deliver(&mut conn, &other, "internal", true).unwrap(),
+                HookSessionAdmission::Observation { .. }
+            ));
+            let ordinary = hook_session(SessionId::new(), ws, proj, None);
+            assert!(matches!(
+                deliver(&mut conn, &ordinary, "internal", false).unwrap(),
+                HookSessionAdmission::Observation { .. }
+            ));
+        }
+
+        #[test]
+        fn internal_prompt_policy_refuses_foreign_owner_agent_and_scope_before_deletion() {
+            let (_tmp, mut conn, ws, proj) = fresh_db();
+            let session = hook_session(SessionId::new(), ws, proj, None);
+            start(&mut conn, &session);
+            let other_proj = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+            for (owner, agent, project) in [
+                (
+                    OwnerFilter::User("user:foreign".into()),
+                    AgentKind::Codex,
+                    proj,
+                ),
+                (OwnerFilter::Unattributed, AgentKind::OpenCode, proj),
+                (OwnerFilter::Unattributed, AgentKind::Codex, other_proj),
+            ] {
+                let mut foreign = session.clone();
+                foreign.agent_kind = agent;
+                foreign.project_id = project;
+                let obs = hook_observation(&foreign);
+                assert!(matches!(
+                    admit_hook_session_event_with_prompt_policy(
+                        &mut conn, &foreign, &obs, &owner, None, None, true
+                    ),
+                    Err(StoreError::SessionCollision)
+                ));
+                assert!(!session_is_purged(&conn, &session).unwrap());
+            }
+            assert!(matches!(
+                deliver(&mut conn, &session, "internal", true).unwrap(),
+                HookSessionAdmission::DroppedInternalPrompt
+            ));
+            assert!(session_is_purged(&conn, &session).unwrap());
+        }
+
+        #[test]
+        fn internal_prompt_policy_failed_delete_rolls_back_tombstone_and_lifecycle() {
+            let (_tmp, mut conn, ws, proj) = fresh_db();
+            let session = hook_session(SessionId::new(), ws, proj, None);
+            start(&mut conn, &session);
+            conn.execute_batch("CREATE TRIGGER reject_internal_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'injected deletion failure'); END;").unwrap();
+            assert!(deliver(&mut conn, &session, "internal", true).is_err());
+            assert!(!session_is_purged(&conn, &session).unwrap());
+            let count: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                    params![session.id.as_bytes()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            conn.execute_batch("DROP TRIGGER reject_internal_delete")
+                .unwrap();
+            deliver(&mut conn, &session, "internal", true).unwrap();
+            assert!(session_is_purged(&conn, &session).unwrap());
+        }
+    }
+
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -11284,7 +11539,9 @@ pub(crate) mod tests {
             | HookSessionAdmission::EndOpen { session, .. }
             | HookSessionAdmission::ReEnd { session, .. }
             | HookSessionAdmission::AlreadyEnded { session } => session,
-            HookSessionAdmission::InvalidMissingEnd | HookSessionAdmission::InvalidScopedEnd => {
+            HookSessionAdmission::DroppedInternalPrompt
+            | HookSessionAdmission::InvalidMissingEnd
+            | HookSessionAdmission::InvalidScopedEnd => {
                 panic!("expected admitted session")
             }
         }

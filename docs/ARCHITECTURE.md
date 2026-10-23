@@ -1416,6 +1416,8 @@ max_attempts = 8                  # failed drain passes before dropping an event
 drop_tool_use_id_prefixes = []    # e.g. ["toolu_plugin_"]: drop a tool event whose id starts so
 drop_tool_names = []              # exact tool names to drop; both lists apply to every project,
                                   # at most 64 entries of 128 characters
+drop_codex_prompt_prefixes = []   # optional literal Codex user-prompt opening prefixes;
+                                  # evaluated during authorized atomic admission (see docs/security.md)
 drop_events = []                  # whole hook event kinds to drop (e.g. ["pre-tool-use"]); a
                                   # matching event is acknowledged and discarded before storage,
                                   # all three lists are checked right after the subagent exclusion (a marked

@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added opt-in `[ingest].drop_codex_prompt_prefixes` for filtering Codex
+  background suggestion and approval requests without dropping normal prompts
+  or other agents. Empty lifecycle shells were tombstoned against spool replay;
+  existing substantive sessions were preserved. (upstream PR pending)
+
 - Added `[handoff] deliver_on_session_start = false` to `.ai-memory.toml`. A
   project that sets it no longer gets its handoff, or the continuity notice, at
   session start; the handoff is still created when the session ends and stays
