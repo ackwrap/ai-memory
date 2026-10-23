@@ -11539,7 +11539,9 @@ pub(crate) mod tests {
             | HookSessionAdmission::EndOpen { session, .. }
             | HookSessionAdmission::ReEnd { session, .. }
             | HookSessionAdmission::AlreadyEnded { session } => session,
-            HookSessionAdmission::InvalidMissingEnd | HookSessionAdmission::InvalidScopedEnd => {
+            HookSessionAdmission::DroppedInternalPrompt
+            | HookSessionAdmission::InvalidMissingEnd
+            | HookSessionAdmission::InvalidScopedEnd => {
                 panic!("expected admitted session")
             }
         }

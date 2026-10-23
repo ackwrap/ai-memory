@@ -4,11 +4,14 @@
 //! client sends: tool calls by tool-use id prefix (Claude Code marks plugin
 //! tool calls with their own id prefix) and tool names exactly, plus whole
 //! hook event kinds (`drop_events`). A matching event is acknowledged like
-//! any other policy drop. All lists run right after the subagent exclusion in
+//! any other policy drop. Tool/event lists run right after the subagent exclusion in
 //! both the single and the batch ingress, so a marked event always seeds tail
 //! tracking before a policy matcher can drop it, and before it reaches the rate
 //! limiter, the ingest semaphore, the sanitizer or storage. The lists are read
 //! once at startup and bounded, so the checks stay cheap on the hook path.
+//! Configured Codex prompt prefixes instead run during authorized atomic
+//! session admission, preserving existing history and preventing spool replay
+//! from resurrecting an empty background session.
 
 use crate::payload::{HookEnvelope, HookEvent};
 
