@@ -21,9 +21,12 @@ jobs:
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Trust the runner-owned checkout inside the build container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
           shared-key: filtered-bookworm
+          cache-on-failure: true
       - name: Install formatting and lint tools
         run: rustup component add rustfmt clippy
       - run: cargo fmt --all -- --check
