@@ -9,7 +9,7 @@
 //! tracking before a policy matcher can drop it, and before it reaches the rate
 //! limiter, the ingest semaphore, the sanitizer or storage. The lists are read
 //! once at startup and bounded, so the checks stay cheap on the hook path.
-//! Configured Codex prompt prefixes instead run during authorized atomic
+//! Configured prompt prefixes instead run during authorized atomic
 //! session admission, preserving existing history and preventing spool replay
 //! from resurrecting an empty background session.
 
@@ -35,8 +35,8 @@ pub struct IngestDropList {
     tool_use_id_prefixes: Vec<String>,
     tool_names: Vec<String>,
     drop_events: IngestDropEvents,
-    codex_prompt_prefixes: Vec<String>,
-    drop_opencode_metadata_only_tools: bool,
+    prompt_prefixes: Vec<String>,
+    drop_metadata_only_tool_events: bool,
 }
 
 impl IngestDropList {
@@ -60,8 +60,8 @@ impl IngestDropList {
             tool_use_id_prefixes,
             tool_names,
             drop_events,
-            codex_prompt_prefixes: Vec::new(),
-            drop_opencode_metadata_only_tools: false,
+            prompt_prefixes: Vec::new(),
+            drop_metadata_only_tool_events: false,
         })
     }
 
@@ -110,44 +110,25 @@ impl IngestDropList {
         self.drop_events.matches(env)
     }
 
-    /// Opt in to dropping OpenCode tool records containing only metadata.
+    /// Opt in to dropping tool records containing only metadata.
     #[must_use]
-    pub fn with_opencode_metadata_only_tools(mut self, enabled: bool) -> Self {
-        self.drop_opencode_metadata_only_tools = enabled;
+    pub fn with_metadata_only_tool_events(mut self, enabled: bool) -> Self {
+        self.drop_metadata_only_tool_events = enabled;
         self
     }
 
-    /// Keep prompts, substantive tool inputs/results, errors, and other agents.
+    /// Keep prompts, substantive tool inputs/results, errors, and uncertain shapes.
     /// Unknown body shapes are retained rather than guessed to be empty.
     #[must_use]
-    pub fn matches_opencode_metadata_only_tool(&self, env: &HookEnvelope) -> bool {
-        if !self.drop_opencode_metadata_only_tools
-            || env.agent != ai_memory_core::AgentKind::OpenCode
+    pub fn matches_metadata_only_tool_event(&self, env: &HookEnvelope) -> bool {
+        if !self.drop_metadata_only_tool_events
             || !matches!(env.event, HookEvent::PreToolUse | HookEvent::PostToolUse)
         {
             return false;
         }
         // Even an unsupported tool's sanitized body can omit its real content.
         // Presence of any native input/output therefore protects the record.
-        if [
-            "args",
-            "input",
-            "tool_input",
-            "tool_response",
-            "tool_output",
-            "output",
-            "result",
-            "error",
-        ]
-        .iter()
-        .filter_map(|key| env.raw.get(*key))
-        .any(|value| match value {
-            serde_json::Value::Null => false,
-            serde_json::Value::String(text) => !text.trim().is_empty(),
-            serde_json::Value::Object(map) => !map.is_empty(),
-            serde_json::Value::Array(items) => !items.is_empty(),
-            _ => true,
-        }) {
+        if has_tool_content(&env.raw) {
             return false;
         }
         let Some(body) = env.body_excerpt.as_deref() else {
@@ -166,26 +147,25 @@ impl IngestDropList {
             })
     }
 
-    /// Configure literal Codex background-prompt prefixes (empty by default).
+    /// Configure literal background-prompt prefixes (empty by default).
     ///
     /// # Errors
     /// Rejects blank, control-containing, oversized, or excessive prefixes.
-    pub fn with_codex_prompt_prefixes(mut self, prefixes: Vec<String>) -> Result<Self, String> {
-        validate("drop_codex_prompt_prefixes", &prefixes)?;
-        self.codex_prompt_prefixes = prefixes;
+    pub fn with_prompt_prefixes(mut self, prefixes: Vec<String>) -> Result<Self, String> {
+        validate("drop_prompt_prefixes", &prefixes)?;
+        self.prompt_prefixes = prefixes;
         Ok(self)
     }
 
-    /// Whether the submitted Codex prompt starts with an operator-listed prefix.
+    /// Whether the submitted prompt starts with an operator-listed prefix.
     /// Prompt drops are applied inside authorized, atomic session admission so
     /// an initial SessionStart and a late spool replay cannot resurrect noise.
     #[must_use]
-    pub fn matches_codex_prompt(&self, env: &HookEnvelope) -> bool {
-        env.agent == ai_memory_core::AgentKind::Codex
-            && env.event == HookEvent::UserPrompt
+    pub fn matches_prompt(&self, env: &HookEnvelope) -> bool {
+        env.event == HookEvent::UserPrompt
             && env.body_excerpt.as_deref().is_some_and(|prompt| {
                 let prompt = prompt.trim_start_matches(['\u{feff}', ' ', '\r', '\n', '\t']);
-                self.codex_prompt_prefixes
+                self.prompt_prefixes
                     .iter()
                     .any(|prefix| prompt.starts_with(prefix))
             })
@@ -291,6 +271,48 @@ impl IngestDropEvents {
     }
 }
 
+// Inspect nested adapter payloads conservatively; configuration stays agent-neutral.
+fn has_tool_content(raw: &serde_json::Value) -> bool {
+    match raw {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            let content_field = matches!(
+                key.as_str(),
+                "args"
+                    | "input"
+                    | "tool_input"
+                    | "arguments"
+                    | "parameters"
+                    | "tool_response"
+                    | "tool_output"
+                    | "output"
+                    | "result"
+                    | "tool_result"
+                    | "response"
+                    | "error"
+                    | "error_message"
+                    | "error_details"
+                    | "message"
+                    | "text"
+                    | "content"
+                    | "command"
+                    | "isError"
+                    | "success"
+                    | "exitCode"
+            );
+            let present = match value {
+                serde_json::Value::Null => false,
+                serde_json::Value::String(text) => !text.trim().is_empty(),
+                serde_json::Value::Object(map) => !map.is_empty(),
+                serde_json::Value::Array(items) => !items.is_empty(),
+                _ => true,
+            };
+            (content_field && present) || has_tool_content(value)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(has_tool_content),
+        _ => false,
+    }
+}
+
 fn validate(list: &str, entries: &[String]) -> Result<(), String> {
     if entries.len() > MAX_DROP_ENTRIES {
         return Err(format!(
@@ -322,10 +344,10 @@ mod tests {
     use crate::payload::HookQuery;
 
     #[test]
-    fn codex_prompt_prefix_policy_is_opt_in_anchored_and_agent_specific() {
+    fn prompt_prefix_policy_is_opt_in_anchored_and_agent_independent() {
         let prefix = "This is an app-generated request for a suggested next user message.";
         let list = IngestDropList::default()
-            .with_codex_prompt_prefixes(vec![prefix.into()])
+            .with_prompt_prefixes(vec![prefix.into()])
             .unwrap();
         for agent in ["codex", "open-code", "claude-code"] {
             for (prompt, expected) in [
@@ -344,18 +366,15 @@ mod tests {
                 ("看看子模块修改，先提交并导出补丁。".into(), false),
             ] {
                 let env = agent_event(agent, "user-prompt", serde_json::json!({"prompt": prompt}));
-                assert_eq!(
-                    list.matches_codex_prompt(&env),
-                    expected && agent == "codex"
-                );
-                assert!(!IngestDropList::default().matches_codex_prompt(&env));
+                assert_eq!(list.matches_prompt(&env), expected);
+                assert!(!IngestDropList::default().matches_prompt(&env));
             }
             let env = agent_event(
                 agent,
                 "post-tool-use",
                 serde_json::json!({"prompt": prefix}),
             );
-            assert!(!list.matches_codex_prompt(&env));
+            assert!(!list.matches_prompt(&env));
         }
         for invalid in [
             vec![String::new()],
@@ -365,15 +384,15 @@ mod tests {
         ] {
             assert!(
                 IngestDropList::default()
-                    .with_codex_prompt_prefixes(invalid)
+                    .with_prompt_prefixes(invalid)
                     .is_err()
             );
         }
     }
 
     #[test]
-    fn opencode_metadata_policy_preserves_native_content_and_prompts() {
-        let list = IngestDropList::default().with_opencode_metadata_only_tools(true);
+    fn metadata_tool_policy_preserves_native_content_and_prompts() {
+        let list = IngestDropList::default().with_metadata_only_tool_events(true);
         for event in ["pre-tool-use", "post-tool-use"] {
             let empty = agent_event(
                 "open-code",
@@ -381,32 +400,44 @@ mod tests {
                 serde_json::json!({"tool":"bash","callID":"call-empty","args":{}}),
             );
             assert!(
-                list.matches_opencode_metadata_only_tool(&empty),
+                list.matches_metadata_only_tool_event(&empty),
                 "{event}: {:?}",
                 empty.body_excerpt
             );
-            assert!(!IngestDropList::default().matches_opencode_metadata_only_tool(&empty));
+            assert!(!IngestDropList::default().matches_metadata_only_tool_event(&empty));
             for extra in [
                 serde_json::json!({"args":{"command":"git status"}}),
                 serde_json::json!({"output":"正常工具结果"}),
                 serde_json::json!({"error":"permission denied"}),
                 serde_json::json!({"result":false}),
+                serde_json::json!({"toolCall":{"args":{"command":"git status"}}}),
+                serde_json::json!({"extra":{"result":"nested normal output"}}),
             ] {
                 let mut raw = serde_json::json!({"tool":"bash","callID":"call-content"});
                 raw.as_object_mut()
                     .unwrap()
                     .extend(extra.as_object().unwrap().clone());
                 let env = agent_event("open-code", event, raw);
-                assert!(!list.matches_opencode_metadata_only_tool(&env));
+                assert!(!list.matches_metadata_only_tool_event(&env));
             }
             let mut uncertain = empty.clone();
             uncertain.body_excerpt = Some("unrecognized body format".into());
-            assert!(!list.matches_opencode_metadata_only_tool(&uncertain));
+            assert!(!list.matches_metadata_only_tool_event(&uncertain));
             uncertain.body_excerpt = Some("tool_family: non-file\noutcome: error".into());
-            assert!(!list.matches_opencode_metadata_only_tool(&uncertain));
+            assert!(!list.matches_metadata_only_tool_event(&uncertain));
             for agent in ["codex", "claude-code"] {
-                let env = agent_event(agent, event, serde_json::json!({"tool_name":"Read"}));
-                assert!(!list.matches_opencode_metadata_only_tool(&env));
+                let empty = agent_event(
+                    agent,
+                    event,
+                    serde_json::json!({"tool_name":"Read","tool_use_id":"empty","tool_input":{}}),
+                );
+                assert!(list.matches_metadata_only_tool_event(&empty));
+                let content = agent_event(
+                    agent,
+                    event,
+                    serde_json::json!({"tool_name":"Read","tool_input":{"file_path":"src/main.rs"},"tool_response":"normal file content"}),
+                );
+                assert!(!list.matches_metadata_only_tool_event(&content));
             }
         }
         let prompt = agent_event(
@@ -414,7 +445,7 @@ mod tests {
             "user-prompt",
             serde_json::json!({"prompt":"正常消息"}),
         );
-        assert!(!list.matches_opencode_metadata_only_tool(&prompt));
+        assert!(!list.matches_metadata_only_tool_event(&prompt));
     }
 
     fn event(name: &str, body: serde_json::Value) -> HookEnvelope {

@@ -1350,11 +1350,11 @@ pub struct IngestSettings {
     /// (`AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use`).
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub drop_events: Vec<String>,
-    /// Literal prefixes of Codex background prompts to discard. Empty by
-    /// default. Other agents and non-prompt events are never matched.
-    pub drop_codex_prompt_prefixes: Vec<String>,
-    /// Drop only OpenCode tool metadata without native input/output. Default false.
-    pub drop_opencode_metadata_only_tools: bool,
+    /// Literal prefixes of background prompts to discard. Empty by
+    /// default. Non-prompt events are never matched.
+    pub drop_prompt_prefixes: Vec<String>,
+    /// Drop tool metadata without native input/output. Default false.
+    pub drop_metadata_only_tool_events: bool,
     /// The validated list the hook router checks. Set by [`Config::load`];
     /// never read from or written to a config file. Kept off the `Config`
     /// stack frame because that value is constructed in short-stack CLI
@@ -2568,10 +2568,8 @@ impl Config {
                 &config.ingest.drop_events,
             )
             .and_then(|list| {
-                list.with_opencode_metadata_only_tools(
-                    config.ingest.drop_opencode_metadata_only_tools,
-                )
-                .with_codex_prompt_prefixes(config.ingest.drop_codex_prompt_prefixes.clone())
+                list.with_metadata_only_tool_events(config.ingest.drop_metadata_only_tool_events)
+                    .with_prompt_prefixes(config.ingest.drop_prompt_prefixes.clone())
             })
             .map_err(|message| anyhow::anyhow!(message))?,
         );
@@ -5359,40 +5357,36 @@ input_token_safety_margin = {margin}
     }
 
     #[test]
-    fn ingest_opencode_metadata_policy_loads_from_external_config() {
+    fn ingest_metadata_tool_policy_loads_from_external_config() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[ingest]\ndrop_opencode_metadata_only_tools = true\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "[ingest]\ndrop_metadata_only_tool_events = true\n").unwrap();
         let config = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(
             config.ingest.drop_list.as_ref(),
-            &ai_memory_hooks::IngestDropList::default().with_opencode_metadata_only_tools(true)
+            &ai_memory_hooks::IngestDropList::default().with_metadata_only_tool_events(true)
         );
     }
 
     #[test]
-    fn ingest_codex_prompt_prefixes_load_from_external_config_and_validate() {
+    fn ingest_prompt_prefixes_load_from_external_config_and_validate() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(
             &path,
-            "[ingest]\ndrop_codex_prompt_prefixes = ['Background request:']\n",
+            "[ingest]\ndrop_prompt_prefixes = ['Background request:']\n",
         )
         .unwrap();
         let config = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(
             config.ingest.drop_list.as_ref(),
             &ai_memory_hooks::IngestDropList::default()
-                .with_codex_prompt_prefixes(vec!["Background request:".into()])
+                .with_prompt_prefixes(vec!["Background request:".into()])
                 .unwrap()
         );
-        std::fs::write(&path, "[ingest]\ndrop_codex_prompt_prefixes = ['']\n").unwrap();
+        std::fs::write(&path, "[ingest]\ndrop_prompt_prefixes = ['']\n").unwrap();
         let error = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap_err();
-        assert!(format!("{error:#}").contains("drop_codex_prompt_prefixes"));
+        assert!(format!("{error:#}").contains("drop_prompt_prefixes"));
     }
 
     /// `[ingest] drop_events` names whole hook event kinds to drop (#1241

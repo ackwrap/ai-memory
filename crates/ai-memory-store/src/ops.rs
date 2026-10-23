@@ -3165,9 +3165,7 @@ pub fn admit_hook_session_event_with_prompt_policy(
         ));
     }
     let session_end = obs.kind == ObservationKind::SessionEnd;
-    let internal_prompt = session.agent_kind == AgentKind::Codex
-        && obs.kind == ObservationKind::UserPrompt
-        && drop_prompt;
+    let internal_prompt = obs.kind == ObservationKind::UserPrompt && drop_prompt;
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     type Row = (
@@ -8414,7 +8412,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn internal_prompt_policy_keeps_normal_history_and_other_agents() {
+        fn internal_prompt_policy_keeps_normal_history_across_agents() {
             let (_tmp, mut conn, ws, proj) = fresh_db();
             let session = hook_session(SessionId::new(), ws, proj, None);
             deliver(&mut conn, &session, "real user prompt", false).unwrap();
@@ -8435,7 +8433,7 @@ pub(crate) mod tests {
             other.agent_kind = AgentKind::OpenCode;
             assert!(matches!(
                 deliver(&mut conn, &other, "internal", true).unwrap(),
-                HookSessionAdmission::Observation { .. }
+                HookSessionAdmission::DroppedInternalPrompt
             ));
             let ordinary = hook_session(SessionId::new(), ws, proj, None);
             assert!(matches!(

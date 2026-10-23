@@ -1629,7 +1629,7 @@ impl WriterHandle {
         .await
     }
 
-    /// Admit a hook using the server's configured Codex prompt-drop decision.
+    /// Admit a hook using the server's configured prompt-drop decision.
     ///
     /// # Errors
     /// Returns ownership, scope, SQL, or writer-channel failures.

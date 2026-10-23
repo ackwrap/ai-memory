@@ -1,6 +1,6 @@
 # Security & isolation boundaries — inventory and adversarial-test map
 
-Codex prompt policy adds an opt-in admission filter (`drop_codex_prompt_prefixes`).
+Codex prompt policy adds an opt-in admission filter (`drop_prompt_prefixes`).
 `ops.rs::internal_prompt_policy_refuses_foreign_owner_agent_and_scope_before_deletion`
 attempts foreign-owner, foreign-agent and foreign-project suppression and proves
 the same-scope control can suppress an empty shell. Removing any corresponding
@@ -223,10 +223,10 @@ classification fails the test. Coverage: **STRONG**.
    `handoff_ownership.rs`, `agent_messages.rs`, `active_project` pointer tests,
    the MCP permission suites). Put boundary tests there.
 
-OpenCode metadata-only ingress filtering is opt-in. The adversarial controls in
-`drop_list::tests::opencode_metadata_policy_preserves_native_content_and_prompts`
-retain inputs, outputs, errors, unknown shapes, and other agents.
-`router::tests::opencode_metadata_policy_single_and_batch_preserve_normal_content`
+Metadata-only ingress filtering is opt-in. The adversarial controls in
+`drop_list::tests::metadata_tool_policy_preserves_native_content_and_prompts`
+retain inputs, outputs, errors, unknown shapes, and nested adapter payloads across agents.
+`router::tests::metadata_tool_policy_single_and_batch_preserve_normal_content`
 checks policy acknowledgements and persisted normal prompts/results through both
-ingress routes. `config::tests::ingest_opencode_metadata_policy_loads_from_external_config`
+ingress routes. `config::tests::ingest_metadata_tool_policy_loads_from_external_config`
 checks external TOML wiring.

@@ -1412,7 +1412,7 @@ max_attempts = 8                  # failed drain passes before dropping an event
 drop_tool_use_id_prefixes = []    # e.g. ["toolu_plugin_"]: drop a tool event whose id starts so
 drop_tool_names = []              # exact tool names to drop; both lists apply to every project,
                                   # at most 64 entries of 128 characters
-drop_codex_prompt_prefixes = []   # optional literal Codex user-prompt opening prefixes;
+drop_prompt_prefixes = []   # optional literal Codex user-prompt opening prefixes;
                                   # evaluated during authorized atomic admission (see docs/security.md)
 drop_events = []                  # whole hook event kinds to drop (e.g. ["pre-tool-use"]); a
                                   # matching event is acknowledged and discarded before storage,
@@ -1739,6 +1739,6 @@ the server URL is loopback and no `default` server profile is registered.
 * [`CLAUDE.md`](../CLAUDE.md): per-session operating rules pinned
   into Claude Code conversations.
 
-`[ingest].drop_opencode_metadata_only_tools` defaults to false and enables the
-OpenCode metadata-only tool matcher in both hook ingress paths. It preserves
+`[ingest].drop_metadata_only_tool_events` defaults to false and enables the
+Metadata-only tool matcher in both hook ingress paths. It preserves
 native content and user prompts; it is independent of whole-kind `drop_events`.

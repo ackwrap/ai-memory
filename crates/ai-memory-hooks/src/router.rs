@@ -856,7 +856,7 @@ async fn admit_hook(
         || state.ingest_drop_list.matches_event_kind(&env)
         || state
             .ingest_drop_list
-            .matches_opencode_metadata_only_tool(&env)
+            .matches_metadata_only_tool_event(&env)
     {
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "ingest drop list");
@@ -1138,7 +1138,7 @@ async fn handle_hook_batch(
             || state.ingest_drop_list.matches_event_kind(&env)
             || state
                 .ingest_drop_list
-                .matches_opencode_metadata_only_tool(&env)
+                .matches_metadata_only_tool_event(&env)
         {
             HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
             results.push(HookBatchResult {
@@ -4340,7 +4340,7 @@ async fn process_authorized(
                 owner_filter.clone(),
                 ingest_key.clone(),
                 moved_from_cwd.clone(),
-                state.ingest_drop_list.matches_codex_prompt(&env),
+                state.ingest_drop_list.matches_prompt(&env),
             )
             .await;
         match result {
@@ -7138,7 +7138,7 @@ pub(crate) mod tests {
         let mut state = make_state(&tmp).await;
         let prefix = "This is an app-generated request for a suggested next user message.";
         state.ingest_drop_list = crate::IngestDropList::default()
-            .with_codex_prompt_prefixes(vec![prefix.into()])
+            .with_prompt_prefixes(vec![prefix.into()])
             .unwrap();
         let reader = state.reader.clone();
         let metrics = state.ingest_metrics.clone();
@@ -7151,7 +7151,7 @@ pub(crate) mod tests {
             {"url":"/hook?agent=codex&event=user-prompt", "body":{"session_id":background,"prompt":prefix}},
             {"url":"/hook?agent=codex&event=stop", "body":{"session_id":background}},
             {"url":"/hook?agent=codex&event=user-prompt", "body":{"session_id":normal,"prompt":"检查子模块并导出补丁"}},
-            {"url":"/hook?agent=open-code&event=user-prompt", "body":{"session_id":opencode,"prompt":prefix}}
+            {"url":"/hook?agent=open-code&event=user-prompt", "body":{"session_id":opencode,"prompt":"正常 OpenCode 用户提问"}}
         ]);
         let response = app
             .clone()
@@ -7186,7 +7186,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             reader.observations_for_session(opencode).await.unwrap()[0].body,
-            prefix
+            "正常 OpenCode 用户提问"
         );
 
         // The asynchronous single endpoint uses the same policy and a 202
@@ -9975,11 +9975,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn opencode_metadata_policy_single_and_batch_preserve_normal_content() {
+    async fn metadata_tool_policy_single_and_batch_preserve_normal_content() {
         let tmp = TempDir::new().unwrap();
         let mut state = make_state(&tmp).await;
         state.ingest_drop_list =
-            crate::drop_list::IngestDropList::default().with_opencode_metadata_only_tools(true);
+            crate::drop_list::IngestDropList::default().with_metadata_only_tool_events(true);
         let state = Arc::new(state);
         let (status, reason) = admit_hook(
             state.clone(),

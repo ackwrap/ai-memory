@@ -13,11 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- Added an opt-in OpenCode metadata-only tool filter that preserves native
+- Added an opt-in agent-independent metadata-only tool filter that preserves native
   inputs, outputs, errors, and normal user prompts.
-- Added opt-in server-side Codex prompt-prefix filtering so background suggestion
+- Added opt-in server-side configurable prompt-prefix filtering so background suggestion
   and approval tasks are not captured as user prompts. Normal session history
-  and other agents were preserved. (fork deployment patch)
+  was preserved. (fork deployment patch)
 
 ## [3.2.2] - 2026-10-22
 

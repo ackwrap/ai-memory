@@ -155,8 +155,8 @@ harness's own fields, such as OpenCode's `callID`. A matching PreToolUse or
 PostToolUse event is acknowledged and discarded before it is sanitized,
 rate-limited or stored. The lists apply to every project on the server.
 
-`[ingest].drop_codex_prompt_prefixes` optionally filters Codex background
-suggestion and approval requests that arrive as `user-prompt`. It is empty by
+`[ingest].drop_prompt_prefixes` optionally filters background
+requests, including suggestion and approval tasks that arrive as `user-prompt`. It is empty by
 default. Entries are literal, case-sensitive opening prefixes, with the same
 64-entry / 128-character limits as tool prefixes. Leading whitespace and a BOM
 are ignored; quoted text and matches later in a prompt are not filtered. For
@@ -164,14 +164,14 @@ example, to suppress suggestion tasks:
 
 ```toml
 [ingest]
-drop_codex_prompt_prefixes = [
+drop_prompt_prefixes = [
   "This is an app-generated request for a suggested next user message.",
 ]
 ```
 
 Restart the server after changing the list; clients need no changes. Single and
 batch hooks acknowledge matching prompts as policy drops after authorization.
-Only Codex prompts match. An otherwise empty, open lifecycle shell is removed
+The configured prefixes apply to every agent. An otherwise empty, open lifecycle shell is removed
 and tombstoned in the writer transaction, preventing late events or spool replay
 from recreating it. Sessions with substantive history, session pages, handoffs,
 or managed-run links are retained; only their matching prompt is dropped. This
@@ -238,12 +238,12 @@ four-rung auth ladder.
 See [`docs/deploy.md`](deploy.md) for the full homelab pattern
 with bearer auth, host allowlisting, and TLS/reverse-proxy options.
 
-### OpenCode metadata-only tool filtering
+### Metadata-only tool filtering
 
-Set `[ingest] drop_opencode_metadata_only_tools = true` to discard OpenCode
-tool events whose normalized body contains only tool metadata and an unknown
+Set `[ingest] drop_metadata_only_tool_events = true` to discard
+tool events from any agent whose normalized body contains only tool metadata and an unknown
 outcome (including the explicit no-output placeholder). Keep `drop_events = []`
 when meaningful tool traffic must remain available. This option defaults to false
 and requires a server restart. Native arguments, inputs, outputs, results, errors,
-known outcomes, unfamiliar body formats, other agents, and all user prompts are
+known outcomes, unfamiliar body formats, and all user prompts are
 preserved. It does not delete existing history.
