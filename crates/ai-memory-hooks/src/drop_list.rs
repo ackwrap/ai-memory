@@ -378,7 +378,7 @@ mod tests {
             let empty = agent_event(
                 "open-code",
                 event,
-                serde_json::json!({"tool":"bash","callID":"call-empty"}),
+                serde_json::json!({"tool":"bash","callID":"call-empty","args":{}}),
             );
             assert!(
                 list.matches_opencode_metadata_only_tool(&empty),

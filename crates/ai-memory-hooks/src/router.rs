@@ -9985,13 +9985,13 @@ pub(crate) mod tests {
             state.clone(),
             HookQuery { event: "pre-tool-use".into(), agent: Some("open-code".into()), ..Default::default() },
             None, None, None, HeaderMap::new(),
-            serde_json::json!({"session_id":"metadata-only-single","cwd":tmp.path(),"tool":"bash","callID":"empty"}),
+            serde_json::json!({"session_id":"metadata-only-single","cwd":tmp.path(),"tool":"bash","callID":"empty","args":{}}),
         ).await;
         assert_eq!((status, reason), (StatusCode::ACCEPTED, "ingest drop list"));
         let items = [
             (
                 "post-tool-use",
-                serde_json::json!({"tool":"bash","callID":"empty"}),
+                serde_json::json!({"tool":"bash","callID":"empty","args":{}}),
             ),
             (
                 "post-tool-use",
