@@ -3144,7 +3144,7 @@ pub fn admit_hook_session_event(
     )
 }
 
-/// Hook admission with a server-configured Codex background-prompt decision.
+/// Hook admission with a server-configured background-prompt decision.
 /// The decision never skips scope, owner, agent, or tombstone validation.
 #[allow(clippy::too_many_arguments)]
 pub fn admit_hook_session_event_with_prompt_policy(
@@ -8445,8 +8445,13 @@ pub(crate) mod tests {
         #[test]
         fn internal_prompt_policy_refuses_foreign_owner_agent_and_scope_before_deletion() {
             let (_tmp, mut conn, ws, proj) = fresh_db();
-            let session = hook_session(SessionId::new(), ws, proj, None);
-            start(&mut conn, &session);
+            let session = hook_session(SessionId::new(), ws, proj, Some("user:owner"));
+            let rightful = OwnerFilter::User("user:owner".into());
+            let mut lifecycle = hook_observation(&session);
+            lifecycle.kind = ObservationKind::SessionStart;
+            lifecycle.body.clear();
+            admit_hook_session_event(&mut conn, &session, &lifecycle, &rightful, None, None)
+                .unwrap();
             let other_proj = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
             for (owner, agent, project) in [
                 (
@@ -8454,23 +8459,29 @@ pub(crate) mod tests {
                     AgentKind::Codex,
                     proj,
                 ),
-                (OwnerFilter::Unattributed, AgentKind::OpenCode, proj),
-                (OwnerFilter::Unattributed, AgentKind::Codex, other_proj),
+                (rightful.clone(), AgentKind::OpenCode, proj),
+                (rightful.clone(), AgentKind::Codex, other_proj),
+                (OwnerFilter::Unattributed, AgentKind::Codex, proj),
             ] {
                 let mut foreign = session.clone();
                 foreign.agent_kind = agent;
                 foreign.project_id = project;
                 let obs = hook_observation(&foreign);
-                assert!(matches!(
-                    admit_hook_session_event_with_prompt_policy(
-                        &mut conn, &foreign, &obs, &owner, None, None, true
-                    ),
-                    Err(StoreError::SessionCollision)
-                ));
+                let result = admit_hook_session_event_with_prompt_policy(
+                    &mut conn, &foreign, &obs, &owner, None, None, true,
+                );
+                assert!(
+                    matches!(result, Err(StoreError::SessionCollision)),
+                    "unexpected admission: {result:?}"
+                );
                 assert!(!session_is_purged(&conn, &session).unwrap());
             }
+            let obs = hook_observation(&session);
             assert!(matches!(
-                deliver(&mut conn, &session, "internal", true).unwrap(),
+                admit_hook_session_event_with_prompt_policy(
+                    &mut conn, &session, &obs, &rightful, None, None, true
+                )
+                .unwrap(),
                 HookSessionAdmission::DroppedInternalPrompt
             ));
             assert!(session_is_purged(&conn, &session).unwrap());
