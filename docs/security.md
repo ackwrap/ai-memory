@@ -155,6 +155,29 @@ harness's own fields, such as OpenCode's `callID`. A matching PreToolUse or
 PostToolUse event is acknowledged and discarded before it is sanitized,
 rate-limited or stored. The lists apply to every project on the server.
 
+`[ingest].drop_codex_prompt_prefixes` optionally filters Codex background
+suggestion and approval requests that arrive as `user-prompt`. It is empty by
+default. Entries are literal, case-sensitive opening prefixes, with the same
+64-entry / 128-character limits as tool prefixes. Leading whitespace and a BOM
+are ignored; quoted text and matches later in a prompt are not filtered. For
+example, to suppress suggestion tasks:
+
+```toml
+[ingest]
+drop_codex_prompt_prefixes = [
+  "This is an app-generated request for a suggested next user message.",
+]
+```
+
+Restart the server after changing the list; clients need no changes. Single and
+batch hooks acknowledge matching prompts as policy drops after authorization.
+Only Codex prompts match. An otherwise empty, open lifecycle shell is removed
+and tombstoned in the writer transaction, preventing late events or spool replay
+from recreating it. Sessions with substantive history, session pages, handoffs,
+or managed-run links are retained; only their matching prompt is dropped. This
+does not scan or delete existing history. Choose specific prefixes: matching
+text submitted literally by a human is indistinguishable from a background task.
+
 For shared servers where each developer should authenticate their own hook
 writes, native Claude Code hooks can use a stored OIDC device token instead of
 embedding a shared static token:

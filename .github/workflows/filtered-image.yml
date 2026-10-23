@@ -1,0 +1,70 @@
+name: Filtered ai-memory image
+on:
+  push:
+    branches: [fix/codex-internal-prompts]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: filtered-image-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify-and-build:
+    if: github.repository == 'ackwrap/ai-memory'
+    runs-on: ubuntu-latest
+    container: rust:1.95-bookworm
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          shared-key: filtered-bookworm
+      - name: Install formatting and lint tools
+        run: rustup component add rustfmt clippy
+      - run: cargo fmt --all -- --check
+      - run: git diff --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets -- --test-threads=2
+      - run: cargo build --locked --release -p ai-memory-cli
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: filtered-linux-amd64
+          path: target/release/ai-memory
+          retention-days: 7
+  image:
+    needs: verify-and-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@v4
+        with:
+          name: filtered-linux-amd64
+          path: dist/docker/ai-memory-linux-x86_64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime-prebuilt-amd64
+          platforms: linux/amd64
+          load: true
+          tags: ackwrap/ai-memory:internal-filter-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Export immutable deployment artifact
+        run: |
+          docker run --rm ackwrap/ai-memory:internal-filter-${GITHUB_SHA} --version
+          docker save ackwrap/ai-memory:internal-filter-${GITHUB_SHA} | gzip > ai-memory-image.tar.gz
+          sha256sum ai-memory-image.tar.gz > ai-memory-image.tar.gz.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: filtered-docker-image
+          path: ai-memory-image.tar.gz*
+          retention-days: 7

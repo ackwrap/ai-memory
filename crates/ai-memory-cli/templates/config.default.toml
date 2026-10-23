@@ -207,6 +207,19 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 # Env equivalent: AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
 # drop_events = ["pre-tool-use"]
 
+# Literal, case-sensitive prefixes of Codex background user-prompt payloads.
+# Empty by default. Other agents, tool events, and quoted/non-leading matches
+# are preserved. Lists use the same 64-entry / 128-character limits as tool
+# prefixes. A match is acknowledged without storing the prompt. A new or
+# empty lifecycle-only session is also tombstoned against later spool replay;
+# existing substantive history, pages, handoffs, and managed runs are retained.
+# Changes take effect when the server restarts; clients need no changes.
+# drop_codex_prompt_prefixes = [
+#   "This is an app-generated request for a suggested next user message.",
+#   "The following is the Codex agent history whose request action you are assessing",
+#   "The following is the Codex agent history added since your last approval assessment",
+# ]
+
 # Privacy strip.
 #
 # Built-in patterns ALWAYS run; they cover bearer tokens, vendor-prefixed

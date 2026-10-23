@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Added opt-in server-side Codex prompt-prefix filtering so background suggestion
+  and approval tasks are not captured as user prompts. Normal session history
+  and other agents were preserved. (local patch; upstream PR pending)
+
 ## [3.2.2] - 2026-10-22
 
 ### Fixed
