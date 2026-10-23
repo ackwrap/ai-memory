@@ -36,6 +36,7 @@ pub struct IngestDropList {
     tool_names: Vec<String>,
     drop_events: IngestDropEvents,
     codex_prompt_prefixes: Vec<String>,
+    drop_opencode_metadata_only_tools: bool,
 }
 
 impl IngestDropList {
@@ -60,6 +61,7 @@ impl IngestDropList {
             tool_names,
             drop_events,
             codex_prompt_prefixes: Vec::new(),
+            drop_opencode_metadata_only_tools: false,
         })
     }
 
@@ -106,6 +108,62 @@ impl IngestDropList {
     #[must_use]
     pub fn matches_event_kind(&self, env: &HookEnvelope) -> bool {
         self.drop_events.matches(env)
+    }
+
+    /// Opt in to dropping OpenCode tool records containing only metadata.
+    #[must_use]
+    pub fn with_opencode_metadata_only_tools(mut self, enabled: bool) -> Self {
+        self.drop_opencode_metadata_only_tools = enabled;
+        self
+    }
+
+    /// Keep prompts, substantive tool inputs/results, errors, and other agents.
+    /// Unknown body shapes are retained rather than guessed to be empty.
+    #[must_use]
+    pub fn matches_opencode_metadata_only_tool(&self, env: &HookEnvelope) -> bool {
+        if !self.drop_opencode_metadata_only_tools
+            || env.agent != ai_memory_core::AgentKind::OpenCode
+            || !matches!(env.event, HookEvent::PreToolUse | HookEvent::PostToolUse)
+        {
+            return false;
+        }
+        // Even an unsupported tool's sanitized body can omit its real content.
+        // Presence of any native input/output therefore protects the record.
+        if [
+            "args",
+            "input",
+            "tool_input",
+            "tool_response",
+            "tool_output",
+            "output",
+            "result",
+            "error",
+        ]
+        .iter()
+        .filter_map(|key| env.raw.get(*key))
+        .any(|value| match value {
+            serde_json::Value::Null => false,
+            serde_json::Value::String(text) => !text.trim().is_empty(),
+            serde_json::Value::Object(map) => !map.is_empty(),
+            serde_json::Value::Array(items) => !items.is_empty(),
+            _ => true,
+        }) {
+            return false;
+        }
+        let Some(body) = env.body_excerpt.as_deref() else {
+            return false;
+        };
+        let body = body
+            .strip_suffix("\n---\n(no output captured)")
+            .unwrap_or(body);
+        body.starts_with("tool_family: ")
+            && body.lines().all(|line| {
+                line.starts_with("tool_family: ")
+                    || line.starts_with("tool_call_id: ")
+                    || line.starts_with("mcp_server: ")
+                    || line.starts_with("mcp_tool: ")
+                    || line == "outcome: unknown"
+            })
     }
 
     /// Configure literal Codex background-prompt prefixes (empty by default).
@@ -311,6 +369,52 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn opencode_metadata_policy_preserves_native_content_and_prompts() {
+        let list = IngestDropList::default().with_opencode_metadata_only_tools(true);
+        for event in ["pre-tool-use", "post-tool-use"] {
+            let empty = agent_event(
+                "open-code",
+                event,
+                serde_json::json!({"tool":"bash","callID":"call-empty"}),
+            );
+            assert!(
+                list.matches_opencode_metadata_only_tool(&empty),
+                "{event}: {:?}",
+                empty.body_excerpt
+            );
+            assert!(!IngestDropList::default().matches_opencode_metadata_only_tool(&empty));
+            for extra in [
+                serde_json::json!({"args":{"command":"git status"}}),
+                serde_json::json!({"output":"正常工具结果"}),
+                serde_json::json!({"error":"permission denied"}),
+                serde_json::json!({"result":false}),
+            ] {
+                let mut raw = serde_json::json!({"tool":"bash","callID":"call-content"});
+                raw.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let env = agent_event("open-code", event, raw);
+                assert!(!list.matches_opencode_metadata_only_tool(&env));
+            }
+            let mut uncertain = empty.clone();
+            uncertain.body_excerpt = Some("unrecognized body format".into());
+            assert!(!list.matches_opencode_metadata_only_tool(&uncertain));
+            uncertain.body_excerpt = Some("tool_family: non-file\noutcome: error".into());
+            assert!(!list.matches_opencode_metadata_only_tool(&uncertain));
+            for agent in ["codex", "claude-code"] {
+                let env = agent_event(agent, event, serde_json::json!({"tool_name":"Read"}));
+                assert!(!list.matches_opencode_metadata_only_tool(&env));
+            }
+        }
+        let prompt = agent_event(
+            "open-code",
+            "user-prompt",
+            serde_json::json!({"prompt":"正常消息"}),
+        );
+        assert!(!list.matches_opencode_metadata_only_tool(&prompt));
     }
 
     fn event(name: &str, body: serde_json::Value) -> HookEnvelope {

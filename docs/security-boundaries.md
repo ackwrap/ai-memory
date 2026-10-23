@@ -222,3 +222,11 @@ classification fails the test. Coverage: **STRONG**.
    defects, so the guards live at integration level (`multi_session.rs`,
    `handoff_ownership.rs`, `agent_messages.rs`, `active_project` pointer tests,
    the MCP permission suites). Put boundary tests there.
+
+OpenCode metadata-only ingress filtering is opt-in. The adversarial controls in
+`drop_list::tests::opencode_metadata_policy_preserves_native_content_and_prompts`
+retain inputs, outputs, errors, unknown shapes, and other agents.
+`router::tests::opencode_metadata_policy_single_and_batch_preserve_normal_content`
+checks policy acknowledgements and persisted normal prompts/results through both
+ingress routes. `config::tests::ingest_opencode_metadata_policy_loads_from_external_config`
+checks external TOML wiring.

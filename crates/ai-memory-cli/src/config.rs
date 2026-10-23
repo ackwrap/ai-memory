@@ -1353,6 +1353,8 @@ pub struct IngestSettings {
     /// Literal prefixes of Codex background prompts to discard. Empty by
     /// default. Other agents and non-prompt events are never matched.
     pub drop_codex_prompt_prefixes: Vec<String>,
+    /// Drop only OpenCode tool metadata without native input/output. Default false.
+    pub drop_opencode_metadata_only_tools: bool,
     /// The validated list the hook router checks. Set by [`Config::load`];
     /// never read from or written to a config file. Kept off the `Config`
     /// stack frame because that value is constructed in short-stack CLI
@@ -2566,7 +2568,10 @@ impl Config {
                 &config.ingest.drop_events,
             )
             .and_then(|list| {
-                list.with_codex_prompt_prefixes(config.ingest.drop_codex_prompt_prefixes.clone())
+                list.with_opencode_metadata_only_tools(
+                    config.ingest.drop_opencode_metadata_only_tools,
+                )
+                .with_codex_prompt_prefixes(config.ingest.drop_codex_prompt_prefixes.clone())
             })
             .map_err(|message| anyhow::anyhow!(message))?,
         );
@@ -5350,6 +5355,22 @@ input_token_safety_margin = {margin}
         assert_eq!(
             Config::default().ingest.drop_list.as_ref(),
             &ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    #[test]
+    fn ingest_opencode_metadata_policy_loads_from_external_config() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ingest]\ndrop_opencode_metadata_only_tools = true\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default().with_opencode_metadata_only_tools(true)
         );
     }
 

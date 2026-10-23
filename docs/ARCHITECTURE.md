@@ -1738,3 +1738,7 @@ the server URL is loopback and no `default` server profile is registered.
   avoid.
 * [`CLAUDE.md`](../CLAUDE.md): per-session operating rules pinned
   into Claude Code conversations.
+
+`[ingest].drop_opencode_metadata_only_tools` defaults to false and enables the
+OpenCode metadata-only tool matcher in both hook ingress paths. It preserves
+native content and user prompts; it is independent of whole-kind `drop_events`.

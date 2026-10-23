@@ -237,3 +237,13 @@ four-rung auth ladder.
 
 See [`docs/deploy.md`](deploy.md) for the full homelab pattern
 with bearer auth, host allowlisting, and TLS/reverse-proxy options.
+
+### OpenCode metadata-only tool filtering
+
+Set `[ingest] drop_opencode_metadata_only_tools = true` to discard OpenCode
+tool events whose normalized body contains only tool metadata and an unknown
+outcome (including the explicit no-output placeholder). Keep `drop_events = []`
+when meaningful tool traffic must remain available. This option defaults to false
+and requires a server restart. Native arguments, inputs, outputs, results, errors,
+known outcomes, unfamiliar body formats, other agents, and all user prompts are
+preserved. It does not delete existing history.

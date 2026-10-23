@@ -852,7 +852,12 @@ async fn admit_hook(
     // matching marked tool event must still seed the tracking set used to
     // suppress that subagent session's unmarked tail. Policy drops remain
     // ahead of the rate limiter and semaphore, so they cost no capacity.
-    if state.ingest_drop_list.matches(&env) || state.ingest_drop_list.matches_event_kind(&env) {
+    if state.ingest_drop_list.matches(&env)
+        || state.ingest_drop_list.matches_event_kind(&env)
+        || state
+            .ingest_drop_list
+            .matches_opencode_metadata_only_tool(&env)
+    {
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "ingest drop list");
     }
@@ -1129,7 +1134,12 @@ async fn handle_hook_batch(
         // All ingest matchers run after subagent classification, so a marked
         // tool event still seeds tracking even when its id, name, or kind is
         // configured for policy drop.
-        if state.ingest_drop_list.matches(&env) || state.ingest_drop_list.matches_event_kind(&env) {
+        if state.ingest_drop_list.matches(&env)
+            || state.ingest_drop_list.matches_event_kind(&env)
+            || state
+                .ingest_drop_list
+                .matches_opencode_metadata_only_tool(&env)
+        {
             HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
             results.push(HookBatchResult {
                 index: idx,
@@ -9962,6 +9972,74 @@ pub(crate) mod tests {
             "both listed items are policy drops"
         );
         assert_eq!(snap.accepted, 1, "control: the unlisted item is ingested");
+    }
+
+    #[tokio::test]
+    async fn opencode_metadata_policy_single_and_batch_preserve_normal_content() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_drop_list =
+            crate::drop_list::IngestDropList::default().with_opencode_metadata_only_tools(true);
+        let state = Arc::new(state);
+        let (status, reason) = admit_hook(
+            state.clone(),
+            HookQuery { event: "pre-tool-use".into(), agent: Some("open-code".into()), ..Default::default() },
+            None, None, None, HeaderMap::new(),
+            serde_json::json!({"session_id":"metadata-only-single","cwd":tmp.path(),"tool":"bash","callID":"empty"}),
+        ).await;
+        assert_eq!((status, reason), (StatusCode::ACCEPTED, "ingest drop list"));
+        let items = [
+            (
+                "post-tool-use",
+                serde_json::json!({"tool":"bash","callID":"empty"}),
+            ),
+            (
+                "post-tool-use",
+                serde_json::json!({"tool":"bash","callID":"real","output":"normal tool output"}),
+            ),
+            (
+                "pre-tool-use",
+                serde_json::json!({"tool":"bash","callID":"input","args":{"command":"git status"}}),
+            ),
+            ("user-prompt", serde_json::json!({"prompt":"正常用户消息"})),
+        ]
+        .into_iter()
+        .map(|(event, extra)| {
+            let mut body =
+                serde_json::json!({"session_id":"metadata-policy-controls","cwd":tmp.path()});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            HookBatchItem {
+                url: format!("http://h/hook?event={event}&agent=open-code"),
+                body,
+            }
+        })
+        .collect();
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.ingest_metrics.snapshot().dropped_by_policy, 2);
+        assert_eq!(state.ingest_metrics.snapshot().accepted, 3);
+        let rows = state
+            .reader
+            .observations_for_session(SessionId::from_native("metadata-policy-controls"))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .any(|row| row.body.contains("normal tool output"))
+        );
+        assert!(rows.iter().any(|row| row.body.contains("正常用户消息")));
     }
 
     /// Install a `[ingest] drop_events` list dropping one whole event kind.

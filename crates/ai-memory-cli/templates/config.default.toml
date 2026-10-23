@@ -214,6 +214,8 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 # empty lifecycle-only session is also tombstoned against later spool replay;
 # existing substantive history, pages, handoffs, and managed runs are retained.
 # Changes take effect when the server restarts; clients need no changes.
+# Drop only OpenCode tool metadata without input/output; leave drop_events empty.
+# drop_opencode_metadata_only_tools = false
 # drop_codex_prompt_prefixes = [
 #   "This is an app-generated request for a suggested next user message.",
 #   "The following is the Codex agent history whose request action you are assessing",
