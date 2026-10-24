@@ -11,6 +11,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in `[[ingest.drop_rules]]` entries with only `name`, `agent`,
+  `events`, and `matcher` for filtering generated requests and other known
+  noise. Matchers are literal, case-insensitive prefixes by default. Empty
+  lifecycle shells matched by a user prompt are tombstoned against spool
+  replay; existing substantive sessions are preserved. The local setup page
+  can add, edit, and remove the same generic rules with bounded validation and
+  an atomic, rollback-backed config update. The former Codex-only key remains
+  compatible. (upstream PR pending)
+
 ### Fixed
 
 - `ai-memory user list` and `ai-memory api-key list` now size their columns

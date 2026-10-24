@@ -155,6 +155,44 @@ harness's own fields, such as OpenCode's `callID`. A matching PreToolUse or
 PostToolUse event is acknowledged and discarded before it is sanitized,
 rate-limited or stored. The lists apply to every project on the server.
 
+`[[ingest.drop_rules]]` optionally filters generated requests or other known
+noise by agent, event kind, and body prefix. It is empty by default. Each rule
+has only `name`, `agent`, `events`, and `matcher`. Matcher entries are literal,
+case-insensitive opening prefixes, with the same 64-entry / 128-character
+limits as tool prefixes. Leading whitespace and a BOM are ignored; quoted text
+and matches later in a body are not filtered. For example, to suppress one
+kind of generated review request from ZCode:
+
+```toml
+[[ingest.drop_rules]]
+name = "generated-review"
+agent = "zcode"
+events = ["user-prompt"]
+matcher = [
+  "You are an internal review agent. Evaluate this generated request:",
+]
+```
+
+Use another rule for another agent; there is no Codex-specific behavior in the
+matcher. The local `ai-memory setup --web` page can add, edit, or remove the
+same four-field rules. It preserves unrelated TOML and a private rollback copy,
+and restarts a setup-managed local service when the rules change. Restart an
+externally managed server yourself; clients need no changes. Single
+and batch hooks acknowledge matching events as policy drops after authorization.
+Only the configured agent and event kinds match. `session-start`, `session-end`,
+and unknown event kinds are rejected at startup. A matching `user-prompt` also
+removes and tombstones an otherwise empty, open lifecycle shell in the writer
+transaction, preventing late events or spool replay from recreating it. Sessions
+with substantive history, session pages, handoffs, or managed-run links are
+retained; only their matching prompt is dropped. Other matching event kinds are
+dropped without deleting their session. This does not scan or delete existing
+history. Choose specific prefixes: matching text submitted literally by a human
+is indistinguishable from a generated task.
+
+The former `[ingest].drop_codex_prompt_prefixes` key is still accepted for
+compatibility and is compiled as a Codex `user-prompt` rule. New configuration
+should use `[[ingest.drop_rules]]`.
+
 For shared servers where each developer should authenticate their own hook
 writes, native Claude Code hooks can use a stored OIDC device token instead of
 embedding a shared static token:

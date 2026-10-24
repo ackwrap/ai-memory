@@ -35,6 +35,19 @@ label.agent small { display: block; color: var(--muted); overflow-wrap: anywhere
 details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
 .others { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; }
 .others label { display: inline-flex; gap: 6px; align-items: center; }
+input, select, textarea { width: 100%; margin-top: 5px; border: 1px solid var(--line); border-radius: 7px; padding: 8px 9px; background: var(--bg); color: var(--fg); font: inherit; }
+label.agent > input, .others input { width: auto; margin-top: 3px; }
+textarea { min-height: 82px; resize: vertical; font-family: var(--mono); font-size: 13px; }
+.rule-list { display: grid; gap: 12px; margin: 14px 0; }
+.rule-card { border: 1px solid var(--line); border-radius: 9px; padding: 13px; }
+.rule-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; }
+.rule-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.rule-wide { grid-column: 1 / -1; }
+.event-options { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 6px; }
+.event-options label { display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 12px; }
+.event-options input { width: auto; margin: 0; }
+button.remove-rule { padding: 5px 9px; background: transparent; color: var(--bad); border: 1px solid var(--line); }
+@media (max-width: 560px) { .rule-grid { grid-template-columns: 1fr; } .rule-wide { grid-column: auto; } }
 button { font: inherit; border: 0; border-radius: 8px; padding: 10px 18px; background: var(--accent); color: var(--accent-fg); cursor: pointer; }
 button[disabled] { opacity: .5; cursor: default; }
 button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--line); }
@@ -77,9 +90,18 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
     </section>
 
     <section>
+      <h2>Capture filters</h2>
+      <p class="note">Optionally discard generated or internal requests before storage. Each rule is limited to one agent and selected events. Matchers are literal body prefixes, case-insensitive by default; leading whitespace is ignored.</p>
+      <div id="drop-rules" class="rule-list"></div>
+      <p id="no-rules" class="note">No custom filter rules. Nothing is filtered by this feature.</p>
+      <button id="add-rule" class="secondary" type="button">Add filter rule</button>
+      <p class="note">Rules are saved to <code id="filter-config-path"></code>. A managed local server is restarted when the rules change; restart an externally managed server yourself.</p>
+    </section>
+
+    <section>
       <div class="actions">
         <button id="apply" type="button">Apply</button>
-        <span class="note">Runs <code>ai-memory setup --yes</code> with the agents you picked, then checks the result.</span>
+        <span class="note">Runs <code>ai-memory setup --yes</code> with the agents and filters you picked, then checks the result.</span>
       </div>
       <pre id="log" hidden></pre>
       <div id="outcome" hidden>
@@ -98,6 +120,8 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
   "use strict";
   var base = location.pathname.replace(/\/?$/, "/");
   var csrf = "";
+  var dropRuleAgents = [];
+  var dropRuleEvents = [];
   var $ = function (id) { return document.getElementById(id); };
   var text = function (id, value) { $(id).textContent = value; };
 
@@ -120,11 +144,123 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
     return box;
   }
 
+  function appendOption(select, value, selected) {
+    var option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    option.selected = selected;
+    select.appendChild(option);
+  }
+
+  function renumberRules() {
+    var cards = $("drop-rules").querySelectorAll(".rule-card");
+    Array.prototype.forEach.call(cards, function (card, index) {
+      card.querySelector(".rule-title").textContent = "Rule " + (index + 1);
+    });
+    $("no-rules").hidden = cards.length > 0;
+  }
+
+  function addRule(rule) {
+    rule = rule || { name: "", agent: dropRuleAgents[0] || "", events: ["user-prompt"], matcher: [] };
+    var card = document.createElement("div");
+    card.className = "rule-card";
+
+    var head = document.createElement("div");
+    head.className = "rule-head";
+    var title = document.createElement("strong");
+    title.className = "rule-title";
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "remove-rule";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", function () { card.remove(); renumberRules(); });
+    head.appendChild(title);
+    head.appendChild(remove);
+    card.appendChild(head);
+
+    var grid = document.createElement("div");
+    grid.className = "rule-grid";
+    var nameLabel = document.createElement("label");
+    nameLabel.appendChild(document.createTextNode("Name"));
+    var name = document.createElement("input");
+    name.className = "rule-name";
+    name.required = true;
+    name.maxLength = 128;
+    name.placeholder = "generated-review-request";
+    name.value = rule.name || "";
+    nameLabel.appendChild(name);
+
+    var agentLabel = document.createElement("label");
+    agentLabel.appendChild(document.createTextNode("Agent"));
+    var agent = document.createElement("select");
+    agent.className = "rule-agent";
+    dropRuleAgents.forEach(function (value) { appendOption(agent, value, value === rule.agent); });
+    agentLabel.appendChild(agent);
+    grid.appendChild(nameLabel);
+    grid.appendChild(agentLabel);
+
+    var eventsField = document.createElement("div");
+    eventsField.className = "rule-wide";
+    eventsField.appendChild(document.createTextNode("Events"));
+    var options = document.createElement("div");
+    options.className = "event-options";
+    dropRuleEvents.forEach(function (value) {
+      var label = document.createElement("label");
+      var input = document.createElement("input");
+      input.type = "checkbox";
+      input.className = "rule-event";
+      input.value = value;
+      input.checked = (rule.events || []).indexOf(value) !== -1;
+      label.appendChild(input);
+      label.appendChild(document.createTextNode(value));
+      options.appendChild(label);
+    });
+    eventsField.appendChild(options);
+    grid.appendChild(eventsField);
+
+    var matcherLabel = document.createElement("label");
+    matcherLabel.className = "rule-wide";
+    matcherLabel.appendChild(document.createTextNode("Matcher (one literal prefix per line)"));
+    var matcher = document.createElement("textarea");
+    matcher.className = "rule-matcher";
+    matcher.maxLength = 8255;
+    matcher.placeholder = "You are an internal review agent…";
+    matcher.value = (rule.matcher || []).join("\n");
+    matcherLabel.appendChild(matcher);
+    grid.appendChild(matcherLabel);
+
+    card.appendChild(grid);
+    $("drop-rules").appendChild(card);
+    renumberRules();
+  }
+
+  function chosenRules() {
+    var cards = Array.prototype.slice.call($("drop-rules").querySelectorAll(".rule-card"));
+    if (cards.length > 64) throw new Error("At most 64 filter rules are allowed.");
+    var seen = {};
+    return cards.map(function (card, index) {
+      var name = card.querySelector(".rule-name").value.trim();
+      var agent = card.querySelector(".rule-agent").value;
+      var events = Array.prototype.slice.call(card.querySelectorAll(".rule-event:checked")).map(function (input) { return input.value; });
+      var matcher = card.querySelector(".rule-matcher").value.split(/\r?\n/).map(function (line) { return line.trim(); }).filter(Boolean);
+      if (!name) throw new Error("Rule " + (index + 1) + " needs a name.");
+      if (seen[name.toLocaleLowerCase()]) throw new Error("Rule names must be unique (ignoring case): " + name);
+      seen[name.toLocaleLowerCase()] = true;
+      if (!agent) throw new Error("Rule " + name + " needs an agent.");
+      if (!events.length) throw new Error("Rule " + name + " needs at least one event.");
+      if (!matcher.length) throw new Error("Rule " + name + " needs at least one matcher.");
+      if (matcher.length > 64) throw new Error("Rule " + name + " may have at most 64 matchers.");
+      if (matcher.some(function (value) { return Array.from(value).length > 128; })) throw new Error("Every matcher in rule " + name + " must be 128 characters or shorter.");
+      return { name: name, agent: agent, events: events, matcher: matcher };
+    });
+  }
+
   function render(doc) {
     var plan = doc.plan;
     csrf = doc.csrf;
     text("data-dir", plan.data_dir);
     text("config-path", plan.config_path);
+    text("filter-config-path", plan.config_path);
     text("fresh", plan.fresh ? "new install: creates the data dir, the config and a root bearer token" : "existing install: kept as it is");
     text("service", plan.service.action === "install"
       ? "install and start a " + plan.service.manager + " at " + plan.service.path
@@ -153,6 +289,10 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       label.appendChild(document.createTextNode(name));
       others.appendChild(label);
     });
+    dropRuleAgents = doc.drop_rule_agents || [];
+    dropRuleEvents = doc.drop_rule_events || [];
+    (doc.drop_rules || []).forEach(addRule);
+    renumberRules();
     text("question", plan.first_question);
     $("loading").hidden = true;
     $("plan").hidden = false;
@@ -203,16 +343,20 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
   $("apply").addEventListener("click", function () {
     var agents = chosen();
     if (agents.length === 0) { fail("Pick at least one agent."); return; }
+    var dropRules;
+    try { dropRules = chosenRules(); } catch (error) { fail(error.message); return; }
     $("failed").hidden = true;
     $("apply").disabled = true;
     $("log").hidden = false;
     $("log").textContent = "";
     $("outcome").hidden = true;
-    post("apply", { agents: agents }).then(function (r) {
+    post("apply", { agents: agents, drop_rules: dropRules }).then(function (r) {
       if (r.status === 202) { poll(0); return; }
       return r.text().then(function (body) { fail(body || ("The server answered " + r.status)); $("apply").disabled = false; });
     }).catch(function () { fail("The setup server did not answer."); $("apply").disabled = false; });
   });
+
+  $("add-rule").addEventListener("click", function () { addRule(); });
 
   $("finish").addEventListener("click", function () {
     post("finish").finally(function () {

@@ -58,7 +58,7 @@ pub use capture_policy::{
     absolute_tool_location_paths, capture_lookup_locations, describe_invalid_capture_config,
     glob_segment_matches, glob_walk, repository_admits_capture, tool_call_payload, valid_call_id,
 };
-pub use drop_list::IngestDropList;
+pub use drop_list::{DROPPABLE_EVENT_NAMES, IngestDropList, IngestDropRule};
 pub use hermes::{hermes_is_delegated_child, hermes_is_first_turn, shape_hermes_lifecycle_body};
 pub use idle_end::{
     IDLE_END_BATCH, IDLE_END_INTERVAL_SECS, IdleEndTickInput, IdleEndTickOutcome, run_idle_end_tick,

@@ -271,9 +271,9 @@ fn setup_without_an_opencode_to_probe_writes_no_opencode_wiring() {
 
 /// `setup --web` through the binary: the printed address serves the page and
 /// plan, a foreign Host is refused, Apply runs `setup --yes --agent
-/// claude-code` (which writes Claude Code's hooks), and Finish stops the
-/// process. No server runs here, so that setup reports its failed self-check
-/// and the wizard exits non-zero after Finish.
+/// claude-code` (which writes Claude Code's hooks) and saves a capture rule,
+/// and Finish stops the process. No server runs here, so that setup reports
+/// its failed self-check and the wizard exits non-zero after Finish.
 #[test]
 fn setup_web_serves_the_plan_and_applies_the_picked_agent() {
     use std::io::{BufRead as _, Read as _, Write as _};
@@ -348,7 +348,7 @@ fn setup_web_serves_the_plan_and_applies_the_picked_agent() {
         "apply",
         &authority,
         &headers,
-        r#"{"agents":["claude-code"]}"#,
+        r#"{"agents":["claude-code"],"drop_rules":[{"name":"generated-review","agent":"zcode","events":["user-prompt"],"matcher":["Internal review:"]}]}"#,
     );
     assert!(applied.starts_with("HTTP/1.1 202"), "{applied}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -368,6 +368,10 @@ fn setup_web_serves_the_plan_and_applies_the_picked_agent() {
         sandbox.home.join(".claude/settings.json").is_file(),
         "{lines}"
     );
+    let config = std::fs::read_to_string(sandbox.data_dir().join("config.toml")).unwrap();
+    assert!(config.contains("[[ingest.drop_rules]]"), "{config}");
+    assert!(config.contains("name = \"generated-review\""), "{config}");
+    assert!(config.contains("agent = \"zcode\""), "{config}");
 
     let finished = request("POST", "finish", &authority, &headers, "{}");
     assert!(finished.starts_with("HTTP/1.1 204"), "{finished}");

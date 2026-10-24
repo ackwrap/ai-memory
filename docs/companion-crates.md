@@ -437,7 +437,9 @@ A [Tauri v2](https://v2.tauri.app) app at
 who would rather not open a terminal (#1273, RFC #878 Phase 4). Its window
 starts on a plain HTML page and then shows the page `ai-memory setup --web`
 serves, so the whole setup UI and its safety rules stay in the CLI. There is
-no npm or JavaScript toolchain.
+no npm or JavaScript toolchain. The same page also edits the optional
+agent/event/prefix capture-filter rules and preserves the rest of the runtime
+configuration through an atomic, rollback-backed update.
 
 It is not a root workspace member. Check it separately:
 

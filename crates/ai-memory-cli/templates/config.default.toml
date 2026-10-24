@@ -207,6 +207,22 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 # Env equivalent: AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
 # drop_events = ["pre-tool-use"]
 
+# Named body-prefix rules. Each rule has only four fields: a unique name, one
+# agent, one or more events, and one or more literal matchers. Matching is a
+# case-insensitive prefix check by default; leading whitespace/BOM is ignored,
+# while quoted or non-leading text is preserved. session-start/session-end are
+# rejected. A matching user-prompt also removes and tombstones a new or empty
+# lifecycle-only session against spool replay; substantive history is retained.
+# Changes take effect when the server restarts; clients need no changes.
+# Example:
+#   [[ingest.drop_rules]]
+#   name = "generated-review"
+#   agent = "zcode"
+#   events = ["user-prompt"]
+#   matcher = [
+#     "You are an internal review agent. Evaluate this generated request:",
+#   ]
+
 # Privacy strip.
 #
 # Built-in patterns ALWAYS run; they cover bearer tokens, vendor-prefixed

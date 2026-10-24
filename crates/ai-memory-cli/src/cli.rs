@@ -2060,6 +2060,10 @@ pub struct SetupArgs {
     /// holds the write end, so the page goes away with the app.
     #[arg(long, requires = "web", hide = true)]
     pub stop_on_stdin_eof: bool,
+    /// Internal handoff from the loopback setup page. The file is bounded,
+    /// validated again by the child, and removed by the parent after setup.
+    #[arg(long, hide = true, requires = "yes")]
+    pub ingest_drop_rules_file: Option<PathBuf>,
 }
 
 /// Arguments for `status`.

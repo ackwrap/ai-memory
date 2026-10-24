@@ -185,9 +185,15 @@ an agent's tool call) it changes nothing and exits non-zero, asking for
 `ai-memory setup --web` shows the same plan as a page in your browser instead
 of the terminal. It prints a one-time address on `127.0.0.1` (and opens it,
 unless `--no-open` or there is no desktop), where you tick the agents to wire
-and press Apply. Apply runs `ai-memory setup --yes --agent <each one you
-picked>` and streams its output to the page, so the result is the same as the
-terminal command; `--no-service` is passed through. The page answers only
+and can optionally add, edit, or remove capture filters using the four fields
+`name`, `agent`, `events`, and `matcher`. Matchers are literal body prefixes
+and ignore case by default. Apply runs `ai-memory setup --yes --agent <each
+one you picked>` and streams its output to the page, so the result is the same
+as the terminal command; `--no-service` is passed through. Filter changes
+atomically replace only the ingest filter rules, migrate the deprecated
+Codex-only filter key when present, retain a private rollback copy, and restart
+a setup-managed local service. Restart an externally managed server yourself.
+The page answers only
 requests that name its own address, carry the secret part of the URL, and,
 for a change, come from the page itself, so another site open in the same
 browser cannot drive it. It holds no token. It stops when you press Finish,

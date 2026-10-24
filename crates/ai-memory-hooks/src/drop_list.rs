@@ -4,18 +4,39 @@
 //! client sends: tool calls by tool-use id prefix (Claude Code marks plugin
 //! tool calls with their own id prefix) and tool names exactly, plus whole
 //! hook event kinds (`drop_events`). A matching event is acknowledged like
-//! any other policy drop. All lists run right after the subagent exclusion in
+//! any other policy drop. Tool/event lists run right after the subagent exclusion in
 //! both the single and the batch ingress, so a marked event always seeds tail
 //! tracking before a policy matcher can drop it, and before it reaches the rate
 //! limiter, the ingest semaphore, the sanitizer or storage. The lists are read
 //! once at startup and bounded, so the checks stay cheap on the hook path.
+//! Configured body-prefix rules instead run during authorized atomic session
+//! admission. A rule names one agent, one or more event kinds, and one or more
+//! literal prefixes. Matching is case-insensitive and anchored after leading
+//! whitespace/BOM. Prompt matches preserve existing history and prevent spool
+//! replay from resurrecting an empty background session.
 
 use crate::payload::{HookEnvelope, HookEvent};
+use ai_memory_core::AgentKind;
 
 /// Most entries either list may hold.
 pub const MAX_DROP_ENTRIES: usize = 64;
 /// Longest entry, in characters.
 pub const MAX_DROP_ENTRY_CHARS: usize = 128;
+/// Hook event names accepted by an agent-scoped drop rule.
+///
+/// The setup UI consumes the same list the validator enforces, so adding a
+/// new droppable event cannot leave the form and the server out of sync.
+pub const DROPPABLE_EVENT_NAMES: [&str; 9] = [
+    "user-prompt",
+    "pre-tool-use",
+    "post-tool-use",
+    "pre-compact",
+    "post-compaction",
+    "notification",
+    "stop",
+    "subagent-start",
+    "subagent-stop",
+];
 
 /// Tool events the server drops by tool-use id prefix or exact tool name,
 /// plus whole hook event kinds dropped outright (`drop_events`). A matching
@@ -32,6 +53,7 @@ pub struct IngestDropList {
     tool_use_id_prefixes: Vec<String>,
     tool_names: Vec<String>,
     drop_events: IngestDropEvents,
+    drop_rules: Vec<IngestDropRule>,
 }
 
 impl IngestDropList {
@@ -55,6 +77,7 @@ impl IngestDropList {
             tool_use_id_prefixes,
             tool_names,
             drop_events,
+            drop_rules: Vec::new(),
         })
     }
 
@@ -102,6 +125,111 @@ impl IngestDropList {
     pub fn matches_event_kind(&self, env: &HookEnvelope) -> bool {
         self.drop_events.matches(env)
     }
+
+    /// Configure agent/event-scoped body-prefix rules (empty by default).
+    ///
+    /// # Errors
+    /// Rejects too many rules or duplicate rule names (case-insensitive).
+    pub fn with_drop_rules(mut self, rules: Vec<IngestDropRule>) -> Result<Self, String> {
+        if rules.len() > MAX_DROP_ENTRIES {
+            return Err(format!(
+                "[ingest].drop_rules holds {} rules; the limit is {MAX_DROP_ENTRIES}",
+                rules.len()
+            ));
+        }
+        for (index, rule) in rules.iter().enumerate() {
+            if rules[..index]
+                .iter()
+                .any(|other| other.name.eq_ignore_ascii_case(&rule.name))
+            {
+                return Err(format!(
+                    "[ingest].drop_rules has duplicate name {:?}",
+                    rule.name
+                ));
+            }
+        }
+        self.drop_rules = rules;
+        Ok(self)
+    }
+
+    /// Whether this event matches an operator-configured body-prefix rule.
+    /// Rules are applied inside authorized, atomic session admission. Prompt
+    /// matches additionally clean up an empty lifecycle-only session so an
+    /// initial SessionStart and a late spool replay cannot resurrect noise.
+    #[must_use]
+    pub fn matches_drop_rule(&self, env: &HookEnvelope) -> bool {
+        self.drop_rules.iter().any(|rule| rule.matches(env))
+    }
+}
+
+/// One named, agent/event-scoped body-prefix rule from `[[ingest.drop_rules]]`.
+///
+/// `matcher` entries are literal prefixes, not regular expressions. Matching
+/// is case-insensitive by default and ignores only leading BOM/whitespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestDropRule {
+    name: String,
+    agent: AgentKind,
+    events: IngestDropEvents,
+    matcher: Vec<String>,
+}
+
+impl IngestDropRule {
+    /// Validate and build a configured rule.
+    ///
+    /// # Errors
+    /// Rejects an unknown agent; blank, unsupported, or session-state events;
+    /// and blank, control-containing, oversized, or excessive matchers.
+    pub fn new(
+        name: String,
+        agent: &str,
+        events: &[String],
+        matcher: Vec<String>,
+    ) -> Result<Self, String> {
+        let name = name.trim().to_owned();
+        validate("drop_rules.name", std::slice::from_ref(&name))?;
+        let normalized_agent = agent.trim().to_ascii_lowercase();
+        let parsed_agent = AgentKind::from_wire(&normalized_agent);
+        if parsed_agent == AgentKind::Other && normalized_agent != "other" {
+            return Err(format!(
+                "[ingest].drop_rules.{name}.agent: {normalized_agent:?} is not a known agent"
+            ));
+        }
+        let event_list = format!("drop_rules.{name}.events");
+        let events = IngestDropEvents::new_named(&event_list, events)?;
+        if events.kinds.is_empty() {
+            return Err(format!(
+                "[ingest].drop_rules.{name}.events must not be empty"
+            ));
+        }
+        let matcher_list = format!("drop_rules.{name}.matcher");
+        validate(&matcher_list, &matcher)?;
+        if matcher.is_empty() {
+            return Err(format!(
+                "[ingest].drop_rules.{name}.matcher must not be empty"
+            ));
+        }
+        Ok(Self {
+            name,
+            agent: parsed_agent,
+            events,
+            matcher: matcher
+                .into_iter()
+                .map(|value| value.to_lowercase())
+                .collect(),
+        })
+    }
+
+    fn matches(&self, env: &HookEnvelope) -> bool {
+        if env.agent != self.agent || !self.events.matches(env) {
+            return false;
+        }
+        env.body_excerpt.as_deref().is_some_and(|body| {
+            let body = body.trim_start_matches(|ch: char| ch == '\u{feff}' || ch.is_whitespace());
+            let body = body.to_lowercase();
+            self.matcher.iter().any(|prefix| body.starts_with(prefix))
+        })
+    }
 }
 
 /// Hook event kinds the server drops outright (`[ingest] drop_events`).
@@ -120,12 +248,6 @@ impl IngestDropList {
 pub struct IngestDropEvents {
     kinds: Vec<HookEvent>,
 }
-
-/// The droppable kinds, as their canonical kebab-case wire names, for error
-/// and config docs.
-const DROPPABLE_KINDS: &str = "user-prompt, pre-tool-use, post-tool-use, \
-     pre-compact, post-compaction, notification, stop, subagent-start, \
-     subagent-stop";
 
 /// Whether an event kind may be named in `[ingest] drop_events`.
 ///
@@ -163,10 +285,14 @@ impl IngestDropEvents {
     /// Returns a message naming the offending value when it is blank, not a
     /// known hook event kind, or a kind that drives session state.
     pub fn new(raw: &[String]) -> Result<Self, String> {
+        Self::new_named("drop_events", raw)
+    }
+
+    fn new_named(list: &str, raw: &[String]) -> Result<Self, String> {
         let mut kinds: Vec<HookEvent> = Vec::with_capacity(raw.len());
         for value in raw {
             if value.trim().is_empty() {
-                return Err("[ingest].drop_events has a blank entry".to_string());
+                return Err(format!("[ingest].{list} has a blank entry"));
             }
             let event = HookEvent::parse(value);
             if !is_droppable_event(event) {
@@ -183,8 +309,8 @@ impl IngestDropEvents {
                     _ => "cannot be dropped",
                 };
                 return Err(format!(
-                    "[ingest].drop_events: {value} {reason}. Droppable kinds: \
-                     {DROPPABLE_KINDS}"
+                    "[ingest].{list}: {value} {reason}. Droppable kinds: {}",
+                    DROPPABLE_EVENT_NAMES.join(", ")
                 ));
             }
             if !kinds.contains(&event) {
@@ -232,6 +358,128 @@ fn validate(list: &str, entries: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::payload::HookQuery;
+
+    #[test]
+    fn drop_rules_are_opt_in_anchored_case_insensitive_and_scoped() {
+        let prefix = "You are an internal review agent. Evaluate this generated request:";
+        let list = IngestDropList::default()
+            .with_drop_rules(vec![
+                IngestDropRule::new(
+                    "generated-review".into(),
+                    "zcode",
+                    &["user-prompt".into()],
+                    vec![prefix.into()],
+                )
+                .unwrap(),
+                IngestDropRule::new(
+                    "claude-noise".into(),
+                    "claude-code",
+                    &["notification".into(), "stop".into()],
+                    vec!["Background task:".into()],
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        for agent in ["zcode", "open-code", "claude-code"] {
+            for (prompt, expected) in [
+                (
+                    format!("{prefix} The user did not write this message."),
+                    true,
+                ),
+                (format!("\u{feff}\n {prefix}"), true),
+                (prefix.to_uppercase(), true),
+                (format!("Please explain this:\n{prefix}"), false),
+                (format!("> {prefix}"), false),
+                (format!("```\n{prefix}\n```"), false),
+                (
+                    "Inspect the submodule changes and export a patch.".into(),
+                    false,
+                ),
+                ("看看子模块修改，先提交并导出补丁。".into(), false),
+            ] {
+                let env = agent_event(agent, "user-prompt", serde_json::json!({"prompt": prompt}));
+                assert_eq!(list.matches_drop_rule(&env), expected && agent == "zcode");
+                assert!(!IngestDropList::default().matches_drop_rule(&env));
+            }
+            let env = agent_event(
+                agent,
+                "post-tool-use",
+                serde_json::json!({"prompt": prefix}),
+            );
+            assert!(!list.matches_drop_rule(&env));
+        }
+        let claude = agent_event(
+            "claude-code",
+            "notification",
+            serde_json::json!({"message": "background TASK: complete"}),
+        );
+        assert!(list.matches_drop_rule(&claude));
+        let wrong_event = agent_event(
+            "claude-code",
+            "user-prompt",
+            serde_json::json!({"prompt": "Background task: complete"}),
+        );
+        assert!(!list.matches_drop_rule(&wrong_event));
+
+        for invalid in [
+            vec![String::new()],
+            vec!["x\ny".into()],
+            vec!["x".repeat(129)],
+            vec!["x".into(); 65],
+        ] {
+            assert!(
+                IngestDropRule::new("invalid".into(), "zcode", &["user-prompt".into()], invalid)
+                    .is_err()
+            );
+        }
+        assert!(
+            IngestDropRule::new(
+                "unknown-agent".into(),
+                "not-an-agent",
+                &["user-prompt".into()],
+                vec!["x".into()]
+            )
+            .is_err()
+        );
+        assert!(
+            IngestDropRule::new(
+                "bad-event".into(),
+                "zcode",
+                &["session-start".into()],
+                vec!["x".into()]
+            )
+            .is_err()
+        );
+        let duplicate = IngestDropList::default().with_drop_rules(vec![
+            IngestDropRule::new(
+                "same".into(),
+                "zcode",
+                &["user-prompt".into()],
+                vec!["x".into()],
+            )
+            .unwrap(),
+            IngestDropRule::new(
+                " SAME ".into(),
+                "zcode",
+                &["user-prompt".into()],
+                vec!["y".into()],
+            )
+            .unwrap(),
+        ]);
+        assert!(duplicate.is_err());
+        let too_many = (0..=MAX_DROP_ENTRIES)
+            .map(|index| {
+                IngestDropRule::new(
+                    format!("rule-{index}"),
+                    "zcode",
+                    &["user-prompt".into()],
+                    vec!["x".into()],
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(IngestDropList::default().with_drop_rules(too_many).is_err());
+    }
 
     fn event(name: &str, body: serde_json::Value) -> HookEnvelope {
         agent_event("claude-code", name, body)

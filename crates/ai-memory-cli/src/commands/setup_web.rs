@@ -19,6 +19,9 @@
 //!   the page reads from its own JSON, which a cross-origin page cannot read;
 //! - agent names are checked against the values `--agent` accepts before they
 //!   reach the child's argument list;
+//! - ingest rules are bounded and validated before a private temporary JSON
+//!   file reaches the child, which validates them again before atomically
+//!   updating only `[[ingest.drop_rules]]`;
 //! - responses forbid caching, framing and referrers, and the page runs under
 //!   a Content-Security-Policy with a per-run nonce and no outside sources;
 //! - it stops on Finish, after [`IDLE_TIMEOUT`] without a request, on
@@ -27,6 +30,7 @@
 //!   outlives the app).
 
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +47,8 @@ use parking_lot::Mutex;
 use subtle::ConstantTimeEq as _;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::Notify;
+
+use crate::config::IngestDropRuleSettings;
 
 /// The page; `__NONCE__` is replaced per run.
 const PAGE: &str = include_str!("../../templates/setup_web.html");
@@ -77,6 +83,8 @@ pub(crate) struct Wizard {
     plan: serde_json::Value,
     /// Every `--agent` value, the only names `apply` accepts.
     accepted: Vec<String>,
+    /// Existing rules, shown as editable rows when the page opens.
+    drop_rules: Vec<IngestDropRuleSettings>,
     /// `setup` arguments every run carries (`--no-service`).
     setup_flags: Vec<OsString>,
     launch: Launch,
@@ -94,6 +102,7 @@ impl Wizard {
         port: u16,
         plan: serde_json::Value,
         accepted: Vec<String>,
+        drop_rules: Vec<IngestDropRuleSettings>,
         setup_flags: Vec<OsString>,
         launch: Launch,
     ) -> Result<Self> {
@@ -108,6 +117,7 @@ impl Wizard {
             nonce: random(16)?,
             plan,
             accepted,
+            drop_rules,
             setup_flags,
             launch,
             run: Mutex::new(RunState::default()),
@@ -151,6 +161,7 @@ impl Wizard {
 pub(crate) async fn serve(
     plan: serde_json::Value,
     accepted: Vec<String>,
+    drop_rules: Vec<IngestDropRuleSettings>,
     setup_flags: Vec<OsString>,
     install_args: Vec<OsString>,
     open_browser: bool,
@@ -165,6 +176,7 @@ pub(crate) async fn serve(
         port,
         plan,
         accepted,
+        drop_rules,
         setup_flags,
         child_launcher(exe, install_args),
     )?);
@@ -336,9 +348,16 @@ async fn page(State(wizard): State<Arc<Wizard>>) -> Response {
 }
 
 async fn plan(State(wizard): State<Arc<Wizard>>) -> Response {
+    let drop_rule_agents: Vec<&str> = ai_memory_core::AgentKind::ALL
+        .iter()
+        .map(|agent| agent.as_str())
+        .collect();
     axum::Json(serde_json::json!({
         "plan": wizard.plan,
         "csrf": wizard.csrf,
+        "drop_rules": &wizard.drop_rules,
+        "drop_rule_agents": drop_rule_agents,
+        "drop_rule_events": ai_memory_hooks::DROPPABLE_EVENT_NAMES,
     }))
     .into_response()
 }
@@ -368,6 +387,10 @@ async fn progress(
 #[derive(serde::Deserialize)]
 struct ApplyBody {
     agents: Vec<String>,
+    /// Absent preserves compatibility with older setup-web clients and leaves
+    /// the config untouched. The bundled page always sends this field; an
+    /// explicit empty array therefore means "remove every custom rule".
+    drop_rules: Option<Vec<IngestDropRuleSettings>>,
 }
 
 async fn apply(
@@ -386,6 +409,34 @@ async fn apply(
     if agents.is_empty() {
         return (StatusCode::BAD_REQUEST, "pick at least one agent").into_response();
     }
+    let mut rule_file = if let Some(rules) = body.drop_rules.as_deref() {
+        if let Err(error) = super::setup::validate_ingest_drop_rules(rules) {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+        let mut file = match tempfile::NamedTempFile::new() {
+            Ok(file) => file,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not create the private ingest-rules file: {error}"),
+                )
+                    .into_response();
+            }
+        };
+        let write_result = serde_json::to_writer(&mut file, rules)
+            .map_err(|error| error.to_string())
+            .and_then(|()| file.flush().map_err(|error| error.to_string()));
+        if let Err(error) = write_result {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not write the private ingest-rules file: {error}"),
+            )
+                .into_response();
+        }
+        Some(file)
+    } else {
+        None
+    };
     {
         let mut run = wizard.run.lock();
         if run.started && !run.done {
@@ -401,6 +452,10 @@ async fn apply(
     for agent in &agents {
         args.push("--agent".into());
         args.push(agent.into());
+    }
+    if let Some(file) = rule_file.as_ref() {
+        args.push("--ingest-drop-rules-file".into());
+        args.push(file.path().as_os_str().to_owned());
     }
     args.extend(wizard.setup_flags.iter().cloned());
     let mut child = match (wizard.launch)(&args) {
@@ -419,6 +474,8 @@ async fn apply(
     };
     let collector = Arc::clone(&wizard);
     tokio::spawn(async move {
+        // Keep the private one-shot file alive until the child has exited.
+        let _rule_file = rule_file.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let out = collect_lines(Arc::clone(&collector), stdout);
@@ -536,6 +593,7 @@ mod tests {
                 PORT,
                 serde_json::json!({"agents": [{"agent": "claude-code"}]}),
                 vec!["claude-code".into(), "codex".into()],
+                Vec::new(),
                 vec!["--no-service".into()],
                 launch,
             )
@@ -636,6 +694,14 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["csrf"], wizard.csrf);
         assert_eq!(json["plan"]["agents"][0]["agent"], "claude-code");
+        assert!(json["drop_rule_agents"].as_array().unwrap().len() > 10);
+        assert!(
+            json["drop_rule_agents"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("zcode"))
+        );
+        assert_eq!(json["drop_rule_events"][0], "user-prompt");
     }
 
     /// A change needs this page's Origin and the CSRF token; each missing or
@@ -675,6 +741,8 @@ mod tests {
             r#"{"agents":["--force"]}"#,
             r#"{"agents":["claude-code","rm -rf"]}"#,
             r#"{"agents":[]}"#,
+            r#"{"agents":["claude-code"],"drop_rules":[{"name":"generated","agent":"unknown-agent","events":["user-prompt"],"matcher":["prefix"]}]}"#,
+            r#"{"agents":["claude-code"],"drop_rules":[{"name":"generated","agent":"zcode","events":["session-end"],"matcher":["prefix"]}]}"#,
         ] {
             let (status, _, _) = send(&wizard, legit(&wizard, "apply", bad)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
@@ -700,26 +768,22 @@ mod tests {
             legit(
                 &wizard,
                 "apply",
-                r#"{"agents":["codex","claude-code","codex"]}"#,
+                r#"{"agents":["codex","claude-code","codex"],"drop_rules":[{"name":"generated-review","agent":"zcode","events":["user-prompt"],"matcher":["Internal review:"]}]}"#,
             ),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(
-            calls.lock().first().cloned(),
-            Some(
-                [
-                    "--yes",
-                    "--agent",
-                    "codex",
-                    "--agent",
-                    "claude-code",
-                    "--no-service"
-                ]
-                .map(str::to_owned)
-                .to_vec()
-            )
-        );
+        {
+            let calls = calls.lock();
+            let args = calls.first().expect("one setup child");
+            assert_eq!(
+                &args[..5],
+                ["--yes", "--agent", "codex", "--agent", "claude-code"]
+            );
+            assert_eq!(args[5], "--ingest-drop-rules-file");
+            assert!(!args[6].is_empty());
+            assert_eq!(args[7], "--no-service");
+        }
         let host = format!("127.0.0.1:{PORT}");
         let deadline = Instant::now() + Duration::from_secs(20);
         let progress = loop {
@@ -747,6 +811,26 @@ mod tests {
 
         let (status, _, _) = send(&wizard, legit(&wizard, "finish", "{}")).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn an_older_client_that_omits_rules_does_not_request_a_config_change() {
+        let (launch, calls) = recording(0);
+        let wizard = wizard(launch);
+        let (status, _, _) = send(
+            &wizard,
+            legit(&wizard, "apply", r#"{"agents":["claude-code"]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            calls.lock().first().cloned(),
+            Some(
+                ["--yes", "--agent", "claude-code", "--no-service"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
     }
 
     #[tokio::test]

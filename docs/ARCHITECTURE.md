@@ -976,7 +976,13 @@ the published checksum, under `~/.local` or `%LOCALAPPDATA%\Programs`.
 (`commands/setup_web.rs`), separate from the read-only `/web` UI: loopback
 only, a one-time path secret, an exact `Host` check, `Origin` plus CSRF on
 every POST, and an Apply that runs `setup --yes --agent ...` as a child
-process (security-boundaries row 17).
+process (security-boundaries row 20). Its optional capture-filter editor sends
+only `name`, `agent`, `events`, and `matcher`; both processes validate the
+bounded rules, the parent passes them through a private one-shot file, and the
+child atomically replaces only `[[ingest.drop_rules]]` while preserving the
+rest of `config.toml` and a private rollback copy. A deprecated
+`drop_codex_prompt_prefixes` list is shown as an ordinary Codex rule and
+migrated away on Apply.
 
 The hidden `render-plugins --out <dir>` generates the Claude Code and Codex
 marketplace plugins under `plugins/` and their catalogs
@@ -1408,7 +1414,7 @@ max_attempts = 8                  # failed drain passes before dropping an event
                                   # still bound retention. Runtime env wins when set:
                                   # AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS
 
-[ingest]                          # server-side drop list for tool events (#1241)
+[ingest]                          # server-side drop policy (#1241)
 drop_tool_use_id_prefixes = []    # e.g. ["toolu_plugin_"]: drop a tool event whose id starts so
 drop_tool_names = []              # exact tool names to drop; both lists apply to every project,
                                   # at most 64 entries of 128 characters
@@ -1439,6 +1445,14 @@ drop_events = []                  # whole hook event kinds to drop (e.g. ["pre-t
                                   # each pairs 1:1 with a post-tool-use that carries the
                                   # content. Empty by default. Env:
                                   # AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
+
+[[ingest.drop_rules]]             # optional named agent/event/body-prefix rules
+name = "generated-review"         # unique, operator-readable name
+agent = "zcode"                   # one known agent wire name
+events = ["user-prompt"]          # one or more non-lifecycle hook event kinds
+matcher = ["You are an internal review agent. Evaluate this generated request:"]
+                                  # literal prefix, case-insensitive by default;
+                                  # evaluated during authorized atomic admission
 ```
 
 The privacy and fidelity tradeoff behind `[consolidation].verbatim_residue`,

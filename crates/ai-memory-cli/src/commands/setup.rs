@@ -36,22 +36,28 @@ use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use ai_memory_hooks::{IngestDropList, IngestDropRule};
 use ai_memory_workstream::{ManagedHarness, OpenCodeDialect, native_store_root};
 use anyhow::{Context as _, Result, bail};
 
 use super::user_service::{self, CommandRunner, ServiceChange, ServiceManager, ServiceUnit};
 use super::{
-    agent_plugins, doctor, init, install_hooks, install_mcp, install_skills, run_autowire,
+    agent_plugins, apply_shared, doctor, init, install_hooks, install_mcp, install_skills,
+    run_autowire,
 };
 use crate::cli::{
     AgentChoice, DoctorArgs, HookInstallScope, InitArgs, InstallHooksArgs, InstallMcpArgs,
     InstallSkillsAgent, InstallSkillsArgs, InstallSkillsScope, McpClient, SetupArgs,
 };
-use crate::config::Config;
+use crate::config::{Config, IngestDropRuleSettings};
 use crate::http_client::{ServerEndpoint, ServerProbe, probe_server};
 
 /// How long `setup` waits for a service it just started to answer.
 const SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Generous transport cap for the loopback page's bounded rule model. The
+/// validated maximum is 64 rules × 64 matchers × 128 characters, plus JSON.
+const MAX_DROP_RULES_FILE_BYTES: u64 = 1024 * 1024;
 
 /// The MCP entry name every installer writes by default.
 const ENTRY_NAME: &str = "ai-memory";
@@ -212,6 +218,11 @@ fn opencode_dialect(
 /// terminal to ask on and no `--yes`), or any step fails; the other steps
 /// still run and the error counts the failures.
 pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -> Result<()> {
+    let drop_rule_update = args
+        .ingest_drop_rules_file
+        .as_deref()
+        .map(load_ingest_drop_rules)
+        .transpose()?;
     let captured = config.runtime_env.process_env().to_vec();
     let env = move |name: &str| -> Option<OsString> {
         captured
@@ -304,6 +315,7 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         return super::setup_web::serve(
             serde_json::to_value(plan_document(&plan))?,
             accepted,
+            editable_ingest_drop_rules(config),
             flags,
             super::service_host::install_args(config, config_path),
             !args.no_open,
@@ -324,8 +336,106 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         plan,
         &user_service::SystemRunner,
         SERVICE_READY_TIMEOUT,
+        drop_rule_update.as_deref(),
     )
     .await
+}
+
+fn editable_ingest_drop_rules(config: &Config) -> Vec<IngestDropRuleSettings> {
+    let mut rules = config.ingest.drop_rules.clone();
+    if !config.ingest.drop_codex_prompt_prefixes.is_empty() {
+        rules.push(IngestDropRuleSettings {
+            name: "legacy-drop-codex-prompt-prefixes".to_owned(),
+            agent: "codex".to_owned(),
+            events: vec!["user-prompt".to_owned()],
+            matcher: config.ingest.drop_codex_prompt_prefixes.clone(),
+        });
+    }
+    rules
+}
+
+/// Read and validate the one-shot rule file written by the loopback setup
+/// page. The child repeats validation so neither a compromised page nor a
+/// hand-written hidden argument can bypass the runtime configuration rules.
+fn load_ingest_drop_rules(path: &Path) -> Result<Vec<IngestDropRuleSettings>> {
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("inspecting ingest drop rules {}", path.display()))?
+        .len();
+    if size > MAX_DROP_RULES_FILE_BYTES {
+        bail!("ingest drop rules file is {size} bytes; the limit is {MAX_DROP_RULES_FILE_BYTES}");
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading ingest drop rules {}", path.display()))?;
+    let rules: Vec<IngestDropRuleSettings> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing ingest drop rules {}", path.display()))?;
+    validate_ingest_drop_rules(&rules)?;
+    Ok(rules)
+}
+
+pub(super) fn validate_ingest_drop_rules(rules: &[IngestDropRuleSettings]) -> Result<()> {
+    let compiled = rules
+        .iter()
+        .map(|rule| {
+            IngestDropRule::new(
+                rule.name.clone(),
+                &rule.agent,
+                &rule.events,
+                rule.matcher.clone(),
+            )
+            .map_err(anyhow::Error::msg)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    IngestDropList::default()
+        .with_drop_rules(compiled)
+        .map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+/// Replace the ingest rule array (and retire its deprecated Codex-only alias),
+/// preserving every unrelated key and comment. The shared apply primitive
+/// follows symlinks, creates a private rollback copy, detects no-ops and
+/// performs an atomic write.
+fn save_ingest_drop_rules(
+    config_path: &Path,
+    data_dir: &Path,
+    rules: &[IngestDropRuleSettings],
+) -> Result<apply_shared::ApplyOutcome> {
+    validate_ingest_drop_rules(rules)?;
+    let backup = apply_shared::PrivateBackup {
+        dir: data_dir.join("backups").join("config"),
+        stem: "config-before-ingest-rules".to_owned(),
+    };
+    apply_shared::apply_atomic_with_backup(config_path, Some(&backup), |original| {
+        apply_shared::mutate_toml(original, |document| {
+            let ingest = document
+                .entry("ingest")
+                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+            let ingest = ingest
+                .as_table_mut()
+                .context("[ingest] is not a TOML table; refusing to replace ingest.drop_rules")?;
+            // A setup-web edit migrates the deprecated Codex-only alias into
+            // the ordinary four-field rule shown by `editable_ingest_drop_rules`.
+            ingest.remove("drop_codex_prompt_prefixes");
+            if rules.is_empty() {
+                ingest.remove("drop_rules");
+                return Ok(());
+            }
+
+            let mut tables = toml_edit::ArrayOfTables::new();
+            for rule in rules {
+                let mut table = toml_edit::Table::new();
+                table.insert("name", toml_edit::value(&rule.name));
+                table.insert("agent", toml_edit::value(&rule.agent));
+                let events: toml_edit::Array = rule.events.iter().map(String::as_str).collect();
+                table.insert("events", toml_edit::value(events));
+                let matcher: toml_edit::Array = rule.matcher.iter().map(String::as_str).collect();
+                table.insert("matcher", toml_edit::value(matcher));
+                tables.push(table);
+            }
+            ingest.insert("drop_rules", toml_edit::Item::ArrayOfTables(tables));
+            Ok(())
+        })
+    })
 }
 
 fn init_config_path(config: &Config, explicit: Option<&Path>) -> PathBuf {
@@ -778,6 +888,7 @@ async fn execute(
     plan: SetupPlan,
     runner: &dyn CommandRunner,
     ready_timeout: Duration,
+    drop_rule_update: Option<&[IngestDropRuleSettings]>,
 ) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
 
@@ -799,12 +910,34 @@ async fn execute(
         outcome.config_path.display()
     );
 
+    let drop_rules_changed = if let Some(rules) = drop_rule_update {
+        let change = save_ingest_drop_rules(&outcome.config_path, &config.data_dir, rules)?;
+        println!("ingest filters: {} {} rule(s)", change.verb(), rules.len());
+        change != apply_shared::ApplyOutcome::NoOp
+    } else {
+        false
+    };
+
     println!("\n== service");
     let mut wait_for_server = false;
     match &plan.service {
-        ServicePlan::Skip(reason) => println!("service: {reason}"),
+        ServicePlan::Skip(reason) => {
+            println!("service: {reason}");
+            if drop_rules_changed {
+                println!("ingest filters: restart the running server to load the new rules");
+            }
+        }
         ServicePlan::Install(unit) => match user_service::install(unit, runner) {
-            Ok(change) => {
+            Ok(mut change) => {
+                if drop_rules_changed && change == ServiceChange::Unchanged {
+                    match user_service::restart(unit, runner) {
+                        Ok(()) => change = ServiceChange::Restarted,
+                        Err(error) => problems.push(format!(
+                            "service: the filters were saved but the service could not restart: \
+                             {error:#}. Restart it manually to load them."
+                        )),
+                    }
+                }
                 wait_for_server = change != ServiceChange::Unchanged;
                 println!(
                     "service: {} {}",
@@ -812,6 +945,7 @@ async fn execute(
                         ServiceChange::Installed => "installed and started",
                         ServiceChange::Updated => "updated and restarted",
                         ServiceChange::Started => "started",
+                        ServiceChange::Restarted => "restarted to load ingest filters from",
                         ServiceChange::Unchanged => "already running from",
                     },
                     unit.path.display()
@@ -1112,6 +1246,96 @@ async fn memory_status(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn generated_rule() -> IngestDropRuleSettings {
+        IngestDropRuleSettings {
+            name: "generated-review".to_owned(),
+            agent: "zcode".to_owned(),
+            events: vec!["user-prompt".to_owned(), "notification".to_owned()],
+            matcher: vec!["You are an internal review agent".to_owned()],
+        }
+    }
+
+    #[test]
+    fn setup_rule_editor_exposes_the_legacy_codex_list_as_a_generic_rule() {
+        let mut config = Config::default();
+        config.ingest.drop_codex_prompt_prefixes = vec!["Legacy generated prompt:".to_owned()];
+        let rules = editable_ingest_drop_rules(&config);
+        assert_eq!(
+            rules,
+            vec![IngestDropRuleSettings {
+                name: "legacy-drop-codex-prompt-prefixes".to_owned(),
+                agent: "codex".to_owned(),
+                events: vec!["user-prompt".to_owned()],
+                matcher: vec!["Legacy generated prompt:".to_owned()],
+            }]
+        );
+    }
+
+    #[test]
+    fn setup_rule_editor_replaces_only_its_array_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "# keep this comment\nbind = \"127.0.0.1:49374\"\n\n[ingest]\n\
+             drop_tool_names = [\"internal-tool\"]\n\
+             drop_codex_prompt_prefixes = [\"legacy\"]\n\n[[ingest.drop_rules]]\n\
+             name = \"old\"\nagent = \"codex\"\nevents = [\"user-prompt\"]\n\
+             matcher = [\"old prefix\"]\n",
+        )
+        .unwrap();
+
+        let rules = vec![generated_rule()];
+        let changed = save_ingest_drop_rules(&config, root.path(), &rules).unwrap();
+        assert_eq!(changed, apply_shared::ApplyOutcome::Updated);
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("# keep this comment"), "{text}");
+        assert!(
+            text.contains("drop_tool_names = [\"internal-tool\"]"),
+            "{text}"
+        );
+        assert!(text.contains("[[ingest.drop_rules]]"), "{text}");
+        assert!(text.contains("name = \"generated-review\""), "{text}");
+        assert!(text.contains("agent = \"zcode\""), "{text}");
+        assert!(!text.contains("name = \"old\""), "{text}");
+        assert!(!text.contains("drop_codex_prompt_prefixes"), "{text}");
+
+        let unchanged = save_ingest_drop_rules(&config, root.path(), &rules).unwrap();
+        assert_eq!(unchanged, apply_shared::ApplyOutcome::NoOp);
+
+        let removed = save_ingest_drop_rules(&config, root.path(), &[]).unwrap();
+        assert_eq!(removed, apply_shared::ApplyOutcome::Updated);
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(!text.contains("[[ingest.drop_rules]]"), "{text}");
+        assert!(
+            text.contains("drop_tool_names = [\"internal-tool\"]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn setup_rule_file_is_validated_before_config_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rules.json");
+        std::fs::write(&path, serde_json::to_vec(&vec![generated_rule()]).unwrap()).unwrap();
+        assert_eq!(
+            load_ingest_drop_rules(&path).unwrap(),
+            vec![generated_rule()]
+        );
+
+        std::fs::write(
+            &path,
+            r#"[{"name":"bad","agent":"future-agent","events":["user-prompt"],"matcher":["prefix"]}]"#,
+        )
+        .unwrap();
+        assert!(
+            load_ingest_drop_rules(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("not a known agent")
+        );
+    }
 
     /// Muse is detected by its config or data directory under the home or
     /// the absolute XDG roots, and not otherwise.

@@ -1328,10 +1328,25 @@ pub struct RoutingSettings {
     pub mid_session: ai_memory_core::MidSessionRouting,
 }
 
-/// `[ingest]`: tool events the server drops whatever the client sends
-/// (#1241). The tool lists and the event-kind list are all empty by default
-/// and apply to every project on the server. Validated once by
-/// [`Config::load`] into [`Self::drop_list`].
+/// One simple agent/event/body matcher under `[[ingest.drop_rules]]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestDropRuleSettings {
+    /// Human-readable unique rule name.
+    pub name: String,
+    /// Agent wire name, such as `codex`, `zcode`, or `claude-code`.
+    pub agent: String,
+    /// Hook event kinds eligible for the rule.
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    pub events: Vec<String>,
+    /// Literal body prefixes. Matching ignores case and leading whitespace.
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    pub matcher: Vec<String>,
+}
+
+/// `[ingest]`: events the server drops whatever the client sends. All lists
+/// and rules are empty by default and apply to every project on the server.
+/// Validated once by [`Config::load`] into [`Self::drop_list`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IngestSettings {
@@ -1350,6 +1365,12 @@ pub struct IngestSettings {
     /// (`AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use`).
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub drop_events: Vec<String>,
+    /// Named agent/event/body-prefix rules. Matchers are literal prefixes,
+    /// case-insensitive by default, after leading BOM/whitespace is ignored.
+    pub drop_rules: Vec<IngestDropRuleSettings>,
+    /// Deprecated compatibility field. Prefer `[[ingest.drop_rules]]`.
+    #[serde(default)]
+    pub drop_codex_prompt_prefixes: Vec<String>,
     /// The validated list the hook router checks. Set by [`Config::load`];
     /// never read from or written to a config file. Kept off the `Config`
     /// stack frame because that value is constructed in short-stack CLI
@@ -2556,12 +2577,38 @@ impl Config {
         if let Err(message) = config.search.fts.validate() {
             anyhow::bail!("{message}");
         }
+        let mut drop_rules = config
+            .ingest
+            .drop_rules
+            .iter()
+            .map(|rule| {
+                ai_memory_hooks::IngestDropRule::new(
+                    rule.name.clone(),
+                    &rule.agent,
+                    &rule.events,
+                    rule.matcher.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::msg)?;
+        if !config.ingest.drop_codex_prompt_prefixes.is_empty() {
+            drop_rules.push(
+                ai_memory_hooks::IngestDropRule::new(
+                    "legacy-drop-codex-prompt-prefixes".to_string(),
+                    "codex",
+                    &["user-prompt".to_string()],
+                    config.ingest.drop_codex_prompt_prefixes.clone(),
+                )
+                .map_err(anyhow::Error::msg)?,
+            );
+        }
         config.ingest.drop_list = Box::new(
             ai_memory_hooks::IngestDropList::new(
                 config.ingest.drop_tool_use_id_prefixes.clone(),
                 config.ingest.drop_tool_names.clone(),
                 &config.ingest.drop_events,
             )
+            .and_then(|list| list.with_drop_rules(drop_rules))
             .map_err(|message| anyhow::anyhow!(message))?,
         );
         // A4 entropy filter thresholds: reject an unusable threshold at startup
@@ -5344,6 +5391,73 @@ input_token_safety_margin = {margin}
         assert_eq!(
             Config::default().ingest.drop_list.as_ref(),
             &ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    #[test]
+    fn ingest_drop_rules_load_from_external_config_and_validate() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[ingest.drop_rules]]\n\
+             name = 'background'\n\
+             agent = 'zcode'\n\
+             events = ['user-prompt', 'notification']\n\
+             matcher = ['Background request:']\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default()
+                .with_drop_rules(vec![
+                    ai_memory_hooks::IngestDropRule::new(
+                        "background".into(),
+                        "zcode",
+                        &["user-prompt".into(), "notification".into()],
+                        vec!["Background request:".into()],
+                    )
+                    .unwrap()
+                ])
+                .unwrap()
+        );
+        std::fs::write(
+            &path,
+            "[[ingest.drop_rules]]\n\
+             name = 'bad'\n\
+             agent = 'zcode'\n\
+             events = ['session-start']\n\
+             matcher = ['x']\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(format!("{error:#}").contains("drop_rules.bad.events"));
+    }
+
+    #[test]
+    fn legacy_codex_prompt_prefixes_still_load() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ingest]\ndrop_codex_prompt_prefixes = ['Background request:']\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default()
+                .with_drop_rules(vec![
+                    ai_memory_hooks::IngestDropRule::new(
+                        "legacy-drop-codex-prompt-prefixes".into(),
+                        "codex",
+                        &["user-prompt".into()],
+                        vec!["Background request:".into()],
+                    )
+                    .unwrap()
+                ])
+                .unwrap()
         );
     }
 

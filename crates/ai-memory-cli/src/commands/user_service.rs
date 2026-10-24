@@ -725,6 +725,9 @@ pub(crate) enum ServiceChange {
     Updated,
     /// The unit was current but the service was not running; it was started.
     Started,
+    /// The unit was current and running, but runtime configuration changed,
+    /// so setup restarted it explicitly.
+    Restarted,
     /// The unit was current and the service already running: nothing done.
     Unchanged,
 }
@@ -763,6 +766,34 @@ pub(crate) fn install(unit: &ServiceUnit, runner: &dyn CommandRunner) -> Result<
         (true, false) => ServiceChange::Updated,
         (true, true) => ServiceChange::Started,
     })
+}
+
+/// Restart an already installed unit so a config-only setup change becomes
+/// active. This never installs or rewrites a unit; callers first establish
+/// ownership by planning and installing the rendered [`ServiceUnit`].
+pub(crate) fn restart(unit: &ServiceUnit, runner: &dyn CommandRunner) -> Result<()> {
+    match unit.manager {
+        ServiceManager::SystemdUser => start_systemd(runner),
+        ServiceManager::Launchd => start_launchd(unit, runner, true),
+        ServiceManager::WindowsRun => {
+            let host = unit
+                .host
+                .as_ref()
+                .context("the Windows logon entry has no host command")?;
+            super::service_host::stop(&host.state_file, runner)?;
+            let exe = host.exe.to_string_lossy();
+            let args: Vec<&str> = host.args.iter().map(String::as_str).collect();
+            let started = runner.run_launcher(&exe, &args)?;
+            if !started.success {
+                bail!(
+                    "`{exe} {}` failed: {}",
+                    args.join(" "),
+                    started.stderr.trim()
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Write the logon entry when it differs, then (re)start the host now so the
@@ -1184,6 +1215,25 @@ mod tests {
                 .all(|call| call.contains("is-active") || call.contains("is-enabled")),
             "{:?}",
             runner.calls.borrow()
+        );
+    }
+
+    #[test]
+    fn a_config_only_change_restarts_a_current_systemd_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = render(ServiceManager::SystemdUser, &spec(tmp.path())).unwrap();
+        write_unit(&unit).unwrap();
+        let before = std::fs::read(&unit.path).unwrap();
+        let runner = FakeRunner::default();
+        restart(&unit, &runner).unwrap();
+        assert_eq!(std::fs::read(&unit.path).unwrap(), before);
+        assert_eq!(
+            runner.calls.borrow().clone(),
+            vec![
+                "systemctl --user daemon-reload",
+                "systemctl --user enable ai-memory.service",
+                "systemctl --user restart ai-memory.service",
+            ]
         );
     }
 

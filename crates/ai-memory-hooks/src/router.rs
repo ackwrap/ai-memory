@@ -4324,12 +4324,13 @@ async fn process_authorized(
         };
         let result = state
             .writer
-            .admit_hook_session_event(
+            .admit_hook_session_event_with_drop_rule(
                 new_session,
                 sanitized,
                 owner_filter.clone(),
                 ingest_key.clone(),
                 moved_from_cwd.clone(),
+                state.ingest_drop_list.matches_drop_rule(&env),
             )
             .await;
         match result {
@@ -4374,6 +4375,9 @@ async fn process_authorized(
             .ok()
     });
     let (admitted, ingest) = match admission {
+        HookSessionAdmission::DroppedByRule => {
+            return Ok(HookProcessingOutcome::DroppedPolicy);
+        }
         HookSessionAdmission::InvalidMissingEnd => {
             info!(session = %session_id, "ignoring missing SessionEnd");
             return Ok(HookProcessingOutcome::IgnoredEnd);
@@ -7116,6 +7120,105 @@ pub(crate) mod tests {
             ingest_drop_list: crate::drop_list::IngestDropList::default(),
             skip_wiki_checkpoints: false,
         }
+    }
+
+    #[tokio::test]
+    async fn drop_rules_single_and_batch_keep_normal_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let prefix = "This is an app-generated request for a suggested next user message.";
+        state.ingest_drop_list = crate::IngestDropList::default()
+            .with_drop_rules(vec![
+                crate::IngestDropRule::new(
+                    "codex-background".into(),
+                    "codex",
+                    &["user-prompt".into()],
+                    vec![prefix.into()],
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let reader = state.reader.clone();
+        let metrics = state.ingest_metrics.clone();
+        let app = hook_router(state);
+        let background = SessionId::new();
+        let normal = SessionId::new();
+        let opencode = SessionId::new();
+        let items = serde_json::json!([
+            {"url":"/hook?agent=codex&event=session-start", "body":{"session_id":background}},
+            {"url":"/hook?agent=codex&event=user-prompt", "body":{"session_id":background,"prompt":prefix}},
+            {"url":"/hook?agent=codex&event=stop", "body":{"session_id":background}},
+            {"url":"/hook?agent=codex&event=user-prompt", "body":{"session_id":normal,"prompt":"检查子模块并导出补丁"}},
+            {"url":"/hook?agent=open-code&event=user-prompt", "body":{"session_id":opencode,"prompt":prefix}}
+        ]);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hook/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(items.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 5);
+        assert_eq!(ack["results"][1]["outcome"], "dropped_policy");
+        assert_eq!(ack["results"][2]["outcome"], "dropped_invalid");
+        assert!(
+            reader
+                .find_session_scope(background)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reader.observations_for_session(normal).await.unwrap()[0].body,
+            "检查子模块并导出补丁"
+        );
+        assert_eq!(
+            reader.observations_for_session(opencode).await.unwrap()[0].body,
+            prefix
+        );
+
+        // The asynchronous single endpoint uses the same policy and a 202
+        // acknowledgement; the dropped item never enters the durable history.
+        let single = SessionId::new();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hook?agent=codex&event=user-prompt")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"session_id":single,"prompt":prefix}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while metrics.snapshot().dropped_by_policy < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(reader.find_session_scope(single).await.unwrap().is_none());
+        assert!(
+            reader
+                .observations_for_session(single)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
