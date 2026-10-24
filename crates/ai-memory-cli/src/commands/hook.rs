@@ -4,11 +4,12 @@
 //! agent's hot path (which would block every tool call on the network and drop
 //! events against a slow/remote server), the event is **spooled** locally — an
 //! instant write. `session-start` performs a short, lock-aware synchronous
-//! cleanup pass before fetching handoff context. `session-end` returns quickly:
-//! after enqueue it spawns a detached `hook-drain` process, whose stdout/stderr
-//! are redirected away from the agent, and that process drains under an
-//! exclusive spool lock with a longer bounded budget. Zero, whose hook sandbox
-//! kills detached children, drains in-process within a short fixed budget.
+//! cleanup pass before fetching handoff context. User prompts and lifecycle
+//! boundaries return quickly: after enqueue they spawn a detached `hook-drain`
+//! process, whose stdout/stderr are redirected away from the agent, and that
+//! process drains under an exclusive spool lock with a longer bounded budget.
+//! Zero, whose hook sandbox kills detached children, drains `session-end`
+//! in-process within a short fixed budget.
 //!
 //! See `docs/windows.md#native-hook-command-claude-code-on-windows`.
 
@@ -147,7 +148,8 @@ fn spawn_background_drainer(data_dir: &Path, live_token: Option<&str>) -> std::i
 }
 
 fn should_spawn_background_drainer(event: &str) -> bool {
-    matches!(event, "session-end" | "stop" | "pre-compact")
+    HookEvent::parse(event) == HookEvent::UserPrompt
+        || matches!(event, "session-end" | "stop" | "pre-compact")
 }
 
 /// Zero runs hooks in a sandbox started with `--die-with-parent`, which kills
@@ -1921,10 +1923,11 @@ where
         }
     }
 
-    // Boundary drain trigger: enqueue first, then ask a detached native drainer
-    // to flush the shared spool. `session-end` remains the primary close path,
-    // but `stop` and `pre-compact` also trigger the helper so delivery does not
-    // rely on the single hook most likely to be cancelled during agent shutdown.
+    // Prompt/boundary drain trigger: enqueue first, then ask a detached native
+    // drainer to flush the shared spool. Prompts flush so server-side filters
+    // apply even to generated sessions that emit no later boundary. `session-end`
+    // remains the primary close path, while `stop` and `pre-compact` avoid
+    // relying on the hook most likely to be cancelled during agent shutdown.
     if !external_capture && session_end_drains_in_process(agent_kind, &args.event) {
         drain_session_end_in_process(&spool, &dd, max_attempts).await;
     } else if !external_capture
@@ -2767,7 +2770,10 @@ mod tests {
     }
 
     #[test]
-    fn boundary_events_trigger_background_drainer() {
+    fn prompts_and_boundary_events_trigger_background_drainer() {
+        assert!(should_spawn_background_drainer("user-prompt"));
+        assert!(should_spawn_background_drainer("user-prompt-submit"));
+        assert!(should_spawn_background_drainer("UserPromptSubmit"));
         assert!(should_spawn_background_drainer("session-end"));
         assert!(should_spawn_background_drainer("stop"));
         assert!(should_spawn_background_drainer("pre-compact"));
@@ -2775,7 +2781,6 @@ mod tests {
         assert!(!should_spawn_background_drainer("session-start"));
         assert!(!should_spawn_background_drainer("post-tool-use"));
         assert!(!should_spawn_background_drainer("pre-tool-use"));
-        assert!(!should_spawn_background_drainer("user-prompt"));
     }
 
     #[test]
@@ -3786,8 +3791,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_and_pre_compact_spawn_background_drainer_after_enqueue() {
-        for event in ["stop", "pre-compact"] {
+    async fn prompts_stop_and_pre_compact_spawn_background_drainer_after_enqueue() {
+        for event in ["user-prompt-submit", "stop", "pre-compact"] {
             let tmp = tempfile::tempdir().unwrap();
             let data_dir = tmp.path().to_path_buf();
             let spool = hook_spool::spool_dir(&data_dir);
@@ -7460,7 +7465,7 @@ mod tests {
             args,
             serde_json::json!({"session_id": "s", "cwd": cwd, "prompt": "hello"}).to_string(),
             &mut stdout,
-            |_, _| panic!("a prompt must only spool"),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -7655,7 +7660,7 @@ mod tests {
                     args,
                     payload.to_string(),
                     &mut stdout,
-                    |_, _| panic!("a Muse event must only spool"),
+                    |_, _| Ok(()),
                 )
                 .await
                 .unwrap();
@@ -8062,7 +8067,7 @@ mod tests {
                 claude_args("user-prompt-submit", &base_a),
                 serde_json::json!({"session_id": "s", "cwd": repo, "prompt": sentinel}).to_string(),
                 &mut stdout,
-                |_, _| panic!("a prompt only spools"),
+                |_, _| Ok(()),
             )
             .await
             .unwrap();

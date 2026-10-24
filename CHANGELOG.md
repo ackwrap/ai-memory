@@ -22,6 +22,11 @@ version in [`docs/changelog/`](docs/changelog/):
   an atomic, rollback-backed config update. The former Codex-only key remains
   compatible. (upstream PR pending)
 
+- Native prompt hooks now start the detached spool drainer immediately after
+  enqueueing. Server-side ingest rules therefore take effect even for short
+  generated sessions whose host never emits `Stop` or `SessionEnd`, instead of
+  leaving an open lifecycle-only shell until another session boundary.
+
 ### Fixed
 
 - `ai-memory user list` and `ai-memory api-key list` now size their columns

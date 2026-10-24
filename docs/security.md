@@ -177,8 +177,11 @@ Use another rule for another agent; there is no Codex-specific behavior in the
 matcher. The local `ai-memory setup --web` page can add, edit, or remove the
 same four-field rules. It preserves unrelated TOML and a private rollback copy,
 and restarts a setup-managed local service when the rules change. Restart an
-externally managed server yourself; clients need no changes. Single
-and batch hooks acknowledge matching events as policy drops after authorization.
+externally managed server yourself. Current native hooks start a detached spool
+drain after each user prompt, so matching takes effect even when a generated
+session exits without `Stop` or `SessionEnd`; update older native clients that
+only drained at lifecycle boundaries. Single and batch hooks acknowledge
+matching events as policy drops after authorization.
 Only the configured agent and event kinds match. `session-start`, `session-end`,
 and unknown event kinds are rejected at startup. A matching `user-prompt` also
 removes and tombstones an otherwise empty, open lifecycle shell in the writer
